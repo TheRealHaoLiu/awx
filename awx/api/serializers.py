@@ -4843,6 +4843,8 @@ class InstanceSerializer(BaseSerializer):
             if self.instance.node_type != value:
                 raise serializers.ValidationError('cannot change node_type')
 
+        return value
+
     def validate_node_state(self, value):
         if not self.instance:
             if value not in [Instance.States.PROVISIONING, Instance.States.INSTALLED]:
@@ -4850,6 +4852,8 @@ class InstanceSerializer(BaseSerializer):
         else:
             if self.instance.node_state != value and value not in [Instance.States.PROVISIONING, Instance.States.INSTALLED, Instance.States.DEPROVISIONING]:
                 raise serializers.ValidationError('modifying an existing instance can only be in provisioning or deprovisoning node_states')
+
+        return value
 
     def validate_peers(self, value):
         pass
