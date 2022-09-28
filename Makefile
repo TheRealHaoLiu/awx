@@ -1,3 +1,5 @@
+-include tools/kube-dev-kind/Makefile
+
 PYTHON ?= python3.9
 OFFICIAL ?= no
 NODE ?= node
@@ -636,3 +638,4 @@ help/generate:
 	} \
 	{ lastLine = $$0 }' $(MAKEFILE_LIST) | sort -u
 	@printf "\n"
+
