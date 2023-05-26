@@ -122,6 +122,13 @@ class TaskBase:
         self.record_aggregate_metrics()
         sys.exit(1)
 
+    def get_local_metrics(self):
+        data = {}
+        for k, metric in self.subsystem_metrics.METRICS.items():
+            if k.startswith(self.prefix) and metric.metric_has_changed:
+                data[k[len(self.prefix) + 1 :]] = metric.current_value
+        return data
+
     def schedule(self):
         # Lock
         with task_manager_bulk_reschedule():
@@ -136,14 +143,14 @@ class TaskBase:
                     self._schedule()
                     commit_start = time.time()
 
-                logger.debug(f"Commiting {self.prefix} Scheduler changes")
-                time_delta = time.time() - commit_start
+                    logger.debug(f"Commiting {self.prefix} Scheduler changes")
 
                 if self.prefix == "task_manager":
-                    self.subsystem_metrics.set(f"{self.prefix}_commit_seconds", time_delta)
+                    self.subsystem_metrics.set(f"{self.prefix}_commit_seconds", time.time() - commit_start)
+                local_metrics = self.get_local_metrics()
                 self.record_aggregate_metrics()
 
-                logger.debug(f"Finished {self.prefix} Scheduler commit in {time_delta} seconds")
+                logger.debug(f"Finished {self.prefix} Scheduler, timing data:\n{local_metrics}")
 
 
 class WorkflowManager(TaskBase):
