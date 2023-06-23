@@ -125,7 +125,7 @@ describe('<InstanceList />, React testing library tests', () => {
   i18n.load({ en: english });
   i18n.activate('en');
 
-  const customRender = (ui, isK8s = true) => {
+  const customRender = (ui, featureInstanceMgmt = true) => {
     jest.spyOn(ConfigContext, 'useConfig').mockImplementation(() => ({
       me: { is_superuser: true },
     }));
@@ -136,7 +136,7 @@ describe('<InstanceList />, React testing library tests', () => {
       },
     });
     InstancesAPI.readOptions.mockResolvedValue(options);
-    SettingsAPI.readCategory.mockResolvedValue({ data: { IS_K8S: isK8s } });
+    SettingsAPI.readCategory.mockResolvedValue({ data: { FEATURE_INSTANCE_MANAGEMENT: featureInstanceMgmt } });
 
     InstanceGroupsAPI.read.mockResolvedValue({
       data: { results: [{ id: 1 }], count: 1 },

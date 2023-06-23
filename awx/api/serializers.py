@@ -5435,7 +5435,7 @@ class InstanceSerializer(BaseSerializer):
         res = super(InstanceSerializer, self).get_related(obj)
         res['jobs'] = self.reverse('api:instance_unified_jobs_list', kwargs={'pk': obj.pk})
         res['instance_groups'] = self.reverse('api:instance_instance_groups_list', kwargs={'pk': obj.pk})
-        if (settings.FEATURE_API_INSTANCE_MANAGEMENT or settings.IS_K8S) and obj.node_type in (Instance.Types.EXECUTION, Instance.Types.HOP):
+        if settings.FEATURE_INSTANCE_MANAGEMENT and obj.node_type in (Instance.Types.EXECUTION, Instance.Types.HOP):
             res['install_bundle'] = self.reverse('api:instance_install_bundle', kwargs={'pk': obj.pk})
         res['peers'] = self.reverse('api:instance_peers_list', kwargs={"pk": obj.pk})
         if self.context['request'].user.is_superuser or self.context['request'].user.is_system_auditor:
@@ -5469,8 +5469,8 @@ class InstanceSerializer(BaseSerializer):
             if self.instance.node_type == Instance.Types.HOP:
                 raise serializers.ValidationError("Hop node instances may not be changed.")
         else:
-            if not settings.IS_K8S and not settings.FEATURE_API_INSTANCE_MANAGEMENT:
-                raise serializers.ValidationError("Can only create instances on Kubernetes or OpenShift.")
+            if not settings.FEATURE_INSTANCE_MANAGEMENT:
+                raise serializers.ValidationError("FEATURE_INSTANCE_MANAGEMENT is not enabled.")
 
         return data
 
@@ -5487,8 +5487,8 @@ class InstanceSerializer(BaseSerializer):
     def validate_node_state(self, value):
         if self.instance:
             if value != self.instance.node_state:
-                if not settings.IS_K8S:
-                    raise serializers.ValidationError("Can only change the state on Kubernetes or OpenShift.")
+                if not settings.FEATURE_INSTANCE_MANAGEMENT:
+                    raise serializers.ValidationError("FEATURE_INSTANCE_MANAGEMENT is not enabled.")
                 if value != Instance.States.DEPROVISIONING:
                     raise serializers.ValidationError("Can only change instances to the 'deprovisioning' state.")
                 if self.instance.node_type not in (Instance.Types.EXECUTION,):

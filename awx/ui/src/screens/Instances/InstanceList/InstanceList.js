@@ -42,7 +42,7 @@ function InstanceList() {
   const [canRunHealthCheck, setCanRunHealthCheck] = useState(true);
 
   const {
-    result: { instances, count, relatedSearchableKeys, searchableKeys, isK8s },
+    result: { instances, count, relatedSearchableKeys, searchableKeys, featureInstanceMgmt },
     error: contentError,
     isLoading,
     request: fetchInstances,
@@ -66,7 +66,7 @@ function InstanceList() {
       setPendingHealthCheck(isPending);
       return {
         instances: response.data.results,
-        isK8s: sysSettings?.data?.IS_K8S ?? false,
+        featureInstanceMgmt: sysSettings?.data?.FEATURE_INSTANCE_MANAGEMENT ?? false,
         count: response.data.count,
         actions: responseActions.data.actions,
         relatedSearchableKeys: (
@@ -81,7 +81,7 @@ function InstanceList() {
       actions: {},
       relatedSearchableKeys: [],
       searchableKeys: [],
-      isK8s: false,
+      featureInstanceMgmt: false,
     }
   );
 
@@ -195,7 +195,7 @@ function InstanceList() {
                 onExpandAll={expandAll}
                 qsConfig={QS_CONFIG}
                 additionalControls={[
-                  ...(isK8s && me.is_superuser
+                  ...(featureInstanceMgmt && me.is_superuser
                     ? [
                         <ToolbarAddButton
                           ouiaId="instances-add-button"
@@ -204,7 +204,7 @@ function InstanceList() {
                         />,
                         <RemoveInstanceButton
                           itemsToRemove={selected}
-                          isK8s={isK8s}
+                          featureInstanceMgmt={featureInstanceMgmt}
                           key="remove"
                           onRemove={handleRemoveInstances}
                         />,

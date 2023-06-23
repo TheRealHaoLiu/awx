@@ -793,6 +793,15 @@ register(
 )
 
 register(
+    'FEATURE_INSTANCE_MANAGEMENT',
+    field_class=fields.BooleanField,
+    read_only=False,
+    category=_('System'),
+    category_slug='system',
+    help_text=_('Indicates whether the instance management feature is enabled.'),
+)
+
+register(
     'BULK_JOB_MAX_LAUNCH',
     field_class=fields.IntegerField,
     default=100,

@@ -65,7 +65,7 @@ describe('<RemoveInstanceButtton />', () => {
     render(
       <I18nProvider i18n={i18n}>
         <RemoveInstanceButton
-          isK8s={true}
+          featureInstanceMgmt={true}
           itemsToRemove={[instances[0]]}
           onRemove={onRemove}
         />
@@ -89,7 +89,7 @@ describe('<RemoveInstanceButtton />', () => {
     const user = userEvent.setup();
     render(
       <RemoveInstanceButton
-        isK8s={true}
+        featureInstanceMgmt={true}
         itemsToRemove={[instances[1]]}
         onRemove={jest.fn()}
       />
@@ -119,7 +119,7 @@ describe('<RemoveInstanceButtton />', () => {
     const onRemove = jest.fn();
     render(
       <RemoveInstanceButton
-        isK8s={true}
+        featureInstanceMgmt={true}
         itemsToRemove={[instances[0]]}
         onRemove={onRemove}
       />

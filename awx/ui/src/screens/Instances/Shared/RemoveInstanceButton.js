@@ -26,7 +26,7 @@ const Label = styled.span`
   }
 `;
 
-function RemoveInstanceButton({ itemsToRemove, onRemove, isK8s }) {
+function RemoveInstanceButton({ itemsToRemove, onRemove, featureInstanceMgmt }) {
   const { isKebabified, onKebabModalChange } = useContext(KebabifiedContext);
   const [removeMessageError, setRemoveMessageError] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -117,7 +117,7 @@ function RemoveInstanceButton({ itemsToRemove, onRemove, isK8s }) {
         <Tooltip content={renderTooltip()} position="top">
           <DropdownItem
             key="add"
-            isDisabled={isDisabled || !isK8s}
+            isDisabled={isDisabled || !featureInstanceMgmt}
             isLoading={isLoading}
             ouiaId="remove-button"
             spinnerAriaValueText={isLoading ? 'Loading' : undefined}
@@ -138,7 +138,7 @@ function RemoveInstanceButton({ itemsToRemove, onRemove, isK8s }) {
               ouiaId="remove-button"
               spinnerAriaValueText={isLoading ? 'Loading' : undefined}
               onClick={() => toggleModal(true)}
-              isDisabled={isDisabled || !isK8s}
+              isDisabled={isDisabled || !featureInstanceMgmt}
             >
               {t`Remove`}
             </Button>

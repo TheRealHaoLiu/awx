@@ -62,7 +62,7 @@ function computeForks(memCapacity, cpuCapacity, selectedCapacityAdjustment) {
   );
 }
 
-function InstanceDetail({ setBreadcrumb, isK8s }) {
+function InstanceDetail({ setBreadcrumb, featureInstanceMgmt }) {
   const config = useConfig();
 
   const { id } = useParams();
@@ -329,11 +329,11 @@ function InstanceDetail({ setBreadcrumb, isK8s }) {
         </DetailList>
         {!isHopNode && (
           <CardActionsRow>
-            {config?.me?.is_superuser && isK8s && isExecutionNode && (
+            {config?.me?.is_superuser && featureInstanceMgmt && isExecutionNode && (
               <RemoveInstanceButton
                 dataCy="remove-instance-button"
                 itemsToRemove={[instance]}
-                isK8s={isK8s}
+                featureInstanceMgmt={featureInstanceMgmt}
                 onRemove={removeInstances}
               />
             )}

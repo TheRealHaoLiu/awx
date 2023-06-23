@@ -34,7 +34,7 @@ function Instance({ setBreadcrumb }) {
   ];
 
   const {
-    result: isK8s,
+    result: featureInstanceMgmt,
     error,
     isLoading,
     request,
@@ -44,16 +44,16 @@ function Instance({ setBreadcrumb }) {
         return false;
       }
       const { data } = await SettingsAPI.readCategory('system');
-      return data?.IS_K8S ?? false;
+      return data?.FEATURE_INSTANCE_MANAGEMENT ?? false;
     }, [canReadSettings]),
-    { isK8s: false, isLoading: true }
+    { featureInstanceMgmt: false, isLoading: true }
   );
 
   useEffect(() => {
     request();
   }, [request]);
 
-  if (isK8s) {
+  if (featureInstanceMgmt) {
     tabsArray.push({ name: t`Peers`, link: `${match.url}/peers`, id: 1 });
   }
   if (isLoading) {
@@ -70,9 +70,9 @@ function Instance({ setBreadcrumb }) {
         <Switch>
           <Redirect from="/instances/:id" to="/instances/:id/details" exact />
           <Route path="/instances/:id/details" key="details">
-            <InstanceDetail isK8s={isK8s} setBreadcrumb={setBreadcrumb} />
+            <InstanceDetail featureInstanceMgmt={featureInstanceMgmt} setBreadcrumb={setBreadcrumb} />
           </Route>
-          {isK8s && (
+          {featureInstanceMgmt && (
             <Route path="/instances/:id/peers" key="peers">
               <InstancePeerList setBreadcrumb={setBreadcrumb} />
             </Route>
