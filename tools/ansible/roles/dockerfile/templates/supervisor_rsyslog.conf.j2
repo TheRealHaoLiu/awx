@@ -59,6 +59,16 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
 
+[eventlistener:master-event-listener]
+command=/usr/bin/failure-event-handler
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+buffer_size = 50
+events=PROCESS_STATE,PROCESS_LOG
+priority=0
+
 [unix_http_server]
 file=/var/run/supervisor/supervisor.rsyslog.sock
 
