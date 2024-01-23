@@ -5,6 +5,7 @@
 import logging
 import sys
 import traceback
+import random
 from datetime import datetime
 
 # Django
@@ -20,7 +21,8 @@ class RSysLogHandler(logging.handlers.SysLogHandler):
     append_nul = False
 
     def _connect_unixsocket(self, address):
-        super(RSysLogHandler, self)._connect_unixsocket(address)
+        random_address = f"{address}_{random.randint(0, settings.LOGGING['handlers']['external_logger'].get('num_sock', 1) -1)}"
+        super(RSysLogHandler, self)._connect_unixsocket(random_address)
         self.socket.setblocking(False)
 
     def handleError(self, record):
@@ -48,7 +50,10 @@ class RSysLogHandler(logging.handlers.SysLogHandler):
     def emit(self, msg):
         if not settings.LOG_AGGREGATOR_ENABLED:
             return
-        return super(RSysLogHandler, self).emit(msg)
+        try:
+            return super(RSysLogHandler, self).emit(msg)
+        except Exception:
+            return super(RSysLogHandler, self).emit(msg)  # retrying 1 more time
 
 
 class SpecialInventoryHandler(logging.Handler):

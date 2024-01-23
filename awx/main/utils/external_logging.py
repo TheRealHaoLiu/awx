@@ -49,10 +49,14 @@ def construct_rsyslog_conf_template(settings=settings):
             f'$MaxMessageSize {max_bytes}',
             '$IncludeConfig /var/lib/awx/rsyslog/conf.d/*.conf',
             'module(load="imuxsock" SysSock.Use="off")',
-            'input(type="imuxsock" Socket="' + settings.LOGGING['handlers']['external_logger']['address'] + '" unlink="on" RateLimit.Burst="0")',
             'template(name="awx" type="string" string="%rawmsg-after-pri%")',
         ]
     )
+
+    for i in range(0, settings.LOGGING['handlers']['external_logger'].get('num_sock', 1)):
+        parts.append(
+            'input(type="imuxsock" Socket="' + settings.LOGGING['handlers']['external_logger']['address'] + "_" + i + '" unlink="on" RateLimit.Burst="0")'
+        )
 
     def escape_quotes(x):
         return x.replace('"', '\\"')

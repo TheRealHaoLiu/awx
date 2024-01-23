@@ -857,6 +857,7 @@ LOGGING = {
             'formatter': 'json',
             'address': '/var/run/awx-rsyslog/rsyslog.sock',
             'filters': ['external_log_enabled', 'dynamic_level_filter', 'guid'],
+            'num_sock': 5,
         },
     },
     'loggers': {
