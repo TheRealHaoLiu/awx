@@ -2,6 +2,7 @@
 name: Build/Push Development Images
 env:
   LC_ALL: "C.UTF-8" # prevent ERROR: Ansible could not initialize the preferred locale: unsupported locale setting
+  PLATFORMS: linux/amd64,linux/arm64
 on:
   push:
     branches:
@@ -43,17 +44,19 @@ jobs:
           docker pull ghcr.io/${OWNER_LC}/awx_kube_devel:${GITHUB_REF##*/} || :
           docker pull ghcr.io/${OWNER_LC}/awx:${GITHUB_REF##*/} || :
 
-      - name: Build images
+      - name: Build and push AWX development environment images
         run: |
-          DEV_DOCKER_TAG_BASE=ghcr.io/${OWNER_LC} COMPOSE_TAG=${GITHUB_REF##*/} make docker-compose-build
-          DEV_DOCKER_TAG_BASE=ghcr.io/${OWNER_LC} COMPOSE_TAG=${GITHUB_REF##*/} make awx-kube-dev-build
-          DEV_DOCKER_TAG_BASE=ghcr.io/${OWNER_LC} COMPOSE_TAG=${GITHUB_REF##*/} make awx-kube-build
+          make docker-compose-buildx
+          make awx-kube-dev-buildx
+          make awx-kube-buildx
+        env:
+          DEV_DOCKER_TAG_BASE: ghcr.io/${OWNER_LC}
+          COMPOSE_TAG: ${GITHUB_REF##*/}
 
-      - name: Push development images
+      - name: Build and push images AWX images
         run: |
-          docker push ghcr.io/${OWNER_LC}/awx_devel:${GITHUB_REF##*/}
-          docker push ghcr.io/${OWNER_LC}/awx_kube_devel:${GITHUB_REF##*/}
-
-      - name: Push AWX k8s image, only for upstream and feature branches
-        run: docker push ghcr.io/${OWNER_LC}/awx:${GITHUB_REF##*/}
+          make awx-kube-buildx
+        env:
+          DEV_DOCKER_TAG_BASE: ghcr.io/${OWNER_LC}
+          COMPOSE_TAG: ${GITHUB_REF##*/}
         if: endsWith(github.repository, '/awx')
