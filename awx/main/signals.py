@@ -679,3 +679,41 @@ def create_access_token_user_if_missing(sender, **kwargs):
         post_save.disconnect(create_access_token_user_if_missing, sender=OAuth2AccessToken)
         obj.save()
         post_save.connect(create_access_token_user_if_missing, sender=OAuth2AccessToken)
+
+
+from ansible_base.resource_registry.shared_types import OrganizationType, TeamType, UserType
+import requests
+import base64
+
+
+@receiver(pre_save, sender=User)
+def update_user_on_gateway(sender, **kwargs):
+
+    updated_user = kwargs['instance']
+    local_user = User.objects.filter(pk=updated_user.pk).first()
+    if not local_user or not local_user.resource.ansible_id:
+        # create or update on gateway with this URL https://localhost/api/gateway/v1/service-index/resources/ with request
+
+        return
+
+    shared_fields = UserType._declared_fields.keys()
+    for field in shared_fields:
+        if getattr(updated_user, field) != getattr(local_user, field):
+            # update user on gateway
+            gateway_url = "https://aap-gw-proxy-1:9080/api/gateway/v1/service-index/resources/" + str(local_user.resource.ansible_id) + '/'
+            # basic auth with username and password
+            headers = {
+                "Content-Type": "application/json",
+            }
+            data = {"resource_data": {}}
+            for field in shared_fields:
+                data["resource_data"][field] = getattr(updated_user, field)
+
+            response = requests.patch(gateway_url, headers=headers, json=data, verify=False, auth=('admin', 'admin'))
+            if response.status_code == 200:
+                # User update successful
+                # extract ansible_id from
+                pass
+            else:
+                # User update failed
+                raise Exception("User update failed on gateway")
