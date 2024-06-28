@@ -1596,7 +1596,8 @@ class JobTemplateAccess(NotificationAttachMixin, UnifiedCredentialsMixin, BaseAc
         inventory = get_value(Inventory, 'inventory')
         if inventory:
             if self.user not in inventory.use_role:
-                self.messages['inventory'] = [_('You do not have use permission on Inventory')]
+                if self.save_messages:
+                    self.messages['inventory'] = [_('You do not have use permission on Inventory')]
                 return False
 
         if not self.check_related('execution_environment', ExecutionEnvironment, data, role_field='read_role'):
@@ -1609,7 +1610,8 @@ class JobTemplateAccess(NotificationAttachMixin, UnifiedCredentialsMixin, BaseAc
             return False
 
         if self.user not in project.use_role:
-            self.messages['project'] = [_('You do not have use permission on Project')]
+            if self.save_messages:
+                self.messages['project'] = [_('You do not have use permission on Project')]
             return False
 
         return True
