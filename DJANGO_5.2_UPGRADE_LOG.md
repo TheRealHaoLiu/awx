@@ -138,6 +138,20 @@ ValueError: chunk_size must be provided when using QuerySet.iterator() after pre
 
 ---
 
+### 10. Fix Database Access During App Initialization
+**File**: `awx/main/dispatch/config.py`
+
+**Change**: Skip `get_auto_max_workers()` call when `mock_publish=True`:
+```python
+# When mock_publish is True (tests), use a simple default instead of calling
+# get_auto_max_workers() which triggers database access through settings.IS_K8S
+max_workers = 4 if mock_publish else get_auto_max_workers()
+```
+
+**Reason**: `get_auto_max_workers()` accesses `settings.IS_K8S` which triggers database access through AWX's custom settings cache. During test initialization, the database may not be available yet. By using a simple default value (4) when `mock_publish=True`, we avoid database access during app initialization in tests while still properly configuring dispatcherd for test execution.
+
+---
+
 ## Verification
 
 ### AWX Startup
@@ -202,6 +216,7 @@ This is a Docker mount permission issue unrelated to Django 5.2. The dispatcherd
 | `pytest.ini` | Remove obsolete warning filter |
 | `awx/main/migrations/0205_*.py` | New migration (auto-generated) |
 | `awx/main/migrations/_dab_rbac.py` | iterator() chunk_size fix |
+| `awx/main/dispatch/config.py` | Skip db access in tests |
 
 ---
 
@@ -213,10 +228,18 @@ This is a Docker mount permission issue unrelated to Django 5.2. The dispatcherd
 
 ---
 
+## Unit Test Status
+
+- **Result**: 3425 passed, 5 skipped, 2 xfailed, 1 xpassed
+- **awxkit tests**: All 245 passed
+- **Duration**: ~2 minutes 9 seconds
+
+---
+
 ## Next Steps (Pending)
 
 1. ~~Run linting tests~~ ✓ (modified files pass)
-2. Run unit tests
+2. ~~Run unit tests~~ ✓ (all pass)
 3. Run migration tests
 4. Run collection tests
 5. Address any test failures

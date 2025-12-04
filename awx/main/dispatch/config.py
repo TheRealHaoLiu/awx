@@ -11,13 +11,20 @@ def get_dispatcherd_config(for_service: bool = False, mock_publish: bool = False
     Parameters:
     for_service: if True, include dynamic options needed for running the dispatcher service
       this will require database access, you should delay evaluation until after app setup
+    mock_publish: if True, use noop broker for testing. This also skips get_auto_max_workers()
+      which accesses database settings (settings.IS_K8S), avoiding database access during
+      app initialization in tests.
     """
+    # When mock_publish is True (tests), use a simple default instead of calling
+    # get_auto_max_workers() which triggers database access through settings.IS_K8S
+    max_workers = 4 if mock_publish else get_auto_max_workers()
+
     config = {
         "version": 2,
         "service": {
             "pool_kwargs": {
                 "min_workers": settings.JOB_EVENT_WORKERS,
-                "max_workers": get_auto_max_workers(),
+                "max_workers": max_workers,
             },
             "main_kwargs": {"node_id": settings.CLUSTER_HOST_ID},
             "process_manager_cls": "ForkServerManager",
