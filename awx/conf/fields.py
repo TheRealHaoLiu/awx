@@ -16,6 +16,14 @@ from rest_framework.serializers import PrimaryKeyRelatedField  # noqa
 # AWX
 from awx.main.constants import CONTAINER_VOLUMES_MOUNT_TYPES, MAX_ISOLATED_PATH_COLON_DELIMITER
 
+# URLValidator regex components (ul was removed in Django 5.0)
+# These are used to build custom URL validation regex that allows numbers in TLD
+_ul = '\u00a1-\uffff'  # Unicode letters range
+_hostname_re = r'[a-z' + _ul + r'0-9](?:[a-z' + _ul + r'0-9-]{0,61}[a-z' + _ul + r'0-9])?'
+_domain_re = r'(?:\.(?!-)[a-z' + _ul + r'0-9-]{1,63}(?<!-))*'
+_ipv4_re = r'(?:0|25[0-5]|2[0-4][0-9]|1[0-9]?[0-9]?|[1-9][0-9]?)(?:\.(?:0|25[0-5]|2[0-4][0-9]|1[0-9]?[0-9]?|[1-9][0-9]?)){3}'
+_ipv6_re = r'\[[0-9a-f:.]+\]'
+
 logger = logging.getLogger('awx.conf.fields')
 
 # Use DRF fields to convert/validate settings:
@@ -163,18 +171,18 @@ class URLField(CharField):
     tld_re = (
         r'\.'  # dot
         r'(?!-)'  # can't start with a dash
-        r'(?:[a-z' + URLValidator.ul + r'0-9' + '-]{2,63}'  # domain label, this line was changed from the original URLValidator
+        r'(?:[a-z' + _ul + r'0-9' + '-]{2,63}'  # domain label, this line was changed from the original URLValidator
         r'|xn--[a-z0-9]{1,59})'  # or punycode label
         r'(?<!-)'  # can't end with a dash
         r'\.?'  # may have a trailing dot
     )
 
-    host_re = '(' + URLValidator.hostname_re + URLValidator.domain_re + tld_re + '|localhost)'
+    host_re = '(' + _hostname_re + _domain_re + tld_re + '|localhost)'
 
     regex = _lazy_re_compile(
         r'^(?:[a-z0-9\.\-\+]*)://'  # scheme is validated separately
         r'(?:[^\s:@/]+(?::[^\s:@/]*)?@)?'  # user:pass authentication
-        r'(?:' + URLValidator.ipv4_re + '|' + URLValidator.ipv6_re + '|' + host_re + ')'
+        r'(?:' + _ipv4_re + '|' + _ipv6_re + '|' + host_re + ')'
         r'(?::\d{2,5})?'  # port
         r'(?:[/?#][^\s]*)?'  # resource path
         r'\Z',
