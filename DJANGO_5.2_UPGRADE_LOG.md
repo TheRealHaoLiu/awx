@@ -236,10 +236,88 @@ This is a Docker mount permission issue unrelated to Django 5.2. The dispatcherd
 
 ---
 
-## Next Steps (Pending)
+### 11. Fix Django 5.2 SQLite Index Handling in Migrations
+
+Django 5.2 has stricter validation when finding indexes to rename or alter. The event partitioning feature (migration 0144) is PostgreSQL-only, but the subsequent index operations (migrations 0144 and 0184) were failing on SQLite test database.
+
+#### 11.1 awx/main/migrations/_sqlite_helper.py
+**Change**: Added two new DB-aware migration operations:
+- `AlterIndexTogether`: Skips execution on non-PostgreSQL databases
+- `RenameIndex`: Skips execution on non-PostgreSQL databases
+
+**Reason**: Event partitioning and the `job_created` column only exist on PostgreSQL. On SQLite, the `AlterIndexTogether` and `RenameIndex` operations were failing because the indexes they reference don't exist.
+
+#### 11.2 awx/main/migrations/0144_event_partitions.py
+**Change**: Replaced `migrations.AlterIndexTogether` with `dbawaremigrations.AlterIndexTogether` for all event table operations.
+
+**Reason**: These operations create indexes on the `job_created` column which only exists on PostgreSQL.
+
+#### 11.3 awx/main/migrations/0184_django_indexes.py
+**Change**:
+- Added import for `dbawaremigrations`
+- Replaced `migrations.RenameIndex` with `dbawaremigrations.RenameIndex` for all event table operations (those with `job_created` in old_fields)
+- Kept regular `migrations.RenameIndex` for role/roleancestorentry tables (these indexes exist on both databases)
+
+**Reason**: The event table indexes being renamed only exist on PostgreSQL.
+
+---
+
+## Migration Test Status
+
+- **Result**: 3 passed, 14 warnings
+- **Duration**: ~5 minutes 49 seconds
+- All migrations run successfully on SQLite test database
+
+---
+
+## Collection Test Status
+
+- **Result**: 179 passed, 2 warnings
+- **Duration**: ~1 minute 1 second
+
+---
+
+## Summary: All Tests Pass ✓
+
+| Test Suite | Result |
+|------------|--------|
+| Linting (black, flake8) | ✓ Pass |
+| Unit Tests | 3425 passed |
+| awxkit Tests | 245 passed |
+| Migration Tests | 3 passed |
+| Collection Tests | 179 passed |
+
+---
+
+## Files Modified (Complete List)
+
+| File | Type of Change |
+|------|----------------|
+| `requirements/requirements.in` | Django version bump |
+| `requirements/requirements.txt` | Regenerated (auto) |
+| `requirements/requirements_dev.txt` | django-debug-toolbar update |
+| `awx/main/models/schedules.py` | pytz to zoneinfo |
+| `awx/main/management/commands/cleanup_jobs.py` | pytz to zoneinfo |
+| `awx/api/views/__init__.py` | pytz to zoneinfo |
+| `awx/main/tests/functional/models/test_schedule.py` | pytz to zoneinfo |
+| `awx/conf/fields.py` | URLValidator.ul fix |
+| `pytest.ini` | Remove obsolete warning filter |
+| `awx/main/migrations/0205_*.py` | New migration (auto-generated) |
+| `awx/main/migrations/_dab_rbac.py` | iterator() chunk_size fix |
+| `awx/main/dispatch/config.py` | Skip db access in tests |
+| `awx/main/migrations/0187_hop_nodes.py` | CheckConstraint condition fix |
+| `awx/main/migrations/_sqlite_helper.py` | DB-aware index operations |
+| `awx/main/migrations/0144_event_partitions.py` | DB-aware AlterIndexTogether |
+| `awx/main/migrations/0184_django_indexes.py` | DB-aware RenameIndex |
+
+---
+
+## Completion Status
 
 1. ~~Run linting tests~~ ✓ (modified files pass)
 2. ~~Run unit tests~~ ✓ (all pass)
-3. Run migration tests
-4. Run collection tests
-5. Address any test failures
+3. ~~Run migration tests~~ ✓ (all pass)
+4. ~~Run collection tests~~ ✓ (all pass)
+5. ~~Commit all changes~~ ✓
+
+**Django 5.2 upgrade complete!**
