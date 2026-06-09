@@ -50,9 +50,8 @@ class HasPolicyEditsMixin(HasEditsMixin):
         abstract = True
 
     def __init__(self, *args, **kwargs):
-        r = super(BaseModel, self).__init__(*args, **kwargs)
+        super(BaseModel, self).__init__(*args, **kwargs)
         self._prior_values_store = self._get_fields_snapshot()
-        return r
 
     def save(self, *args, **kwargs):
         super(BaseModel, self).save(*args, **kwargs)
@@ -486,6 +485,7 @@ class InstanceGroup(HasPolicyEditsMixin, BaseModel, RelatedJobsMixin, ResourceMi
 
     class Meta:
         app_label = 'main'
+        ordering = ('pk',)
         permissions = [('use_instancegroup', 'Can use instance group in a preference list of a resource')]
         # Since this has no direct organization field only superuser can add, so remove add permission
         default_permissions = ('change', 'delete', 'view')

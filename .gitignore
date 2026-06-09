@@ -160,3 +160,7 @@ _readthedocs/
 
 # Pyenv
 .python-version
+
+# Graphify knowledge graph (local-only outputs)
+graphify-out/cache/
+graphify-out/cost.json

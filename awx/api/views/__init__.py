@@ -14,13 +14,14 @@ import sys
 import time
 from base64 import b64encode
 from collections import OrderedDict
+from jwt import decode as _jwt_decode
 
 from urllib3.exceptions import ConnectTimeoutError
 
 # Django
 from django.conf import settings
 from django.core.exceptions import FieldError, ObjectDoesNotExist
-from django.db.models import Q, Sum, Count
+from django.db.models import Q, Sum, Count, Subquery, OuterRef
 from django.db import IntegrityError, ProgrammingError, transaction, connection
 from django.db.models.fields.related import ManyToManyField, ForeignKey
 from django.db.models.functions import Trunc
@@ -50,15 +51,21 @@ from rest_framework_yaml.renderers import YAMLRenderer
 # ansi2html
 from ansi2html import Ansi2HTMLConverter
 
-import pytz
+from datetime import timezone as dt_timezone
 from wsgiref.util import FileWrapper
+from drf_spectacular.utils import extend_schema_view, extend_schema
 
 # django-ansible-base
 from ansible_base.lib.utils.requests import get_remote_hosts
 from ansible_base.rbac.models import RoleEvaluation
 from ansible_base.lib.utils.schema import extend_schema_if_available
+from ansible_base.lib.workload_identity.controller import AutomationControllerJobScope
+
+# flags
+from flags.state import flag_enabled
 
 # AWX
+from awx.main.utils.workload_identity import retrieve_workload_identity_jwt_with_claims
 from awx.main.tasks.system import send_notifications, update_inventory_computed_fields
 from awx.main.access import get_user_queryset
 from awx.api.generics import (
@@ -202,11 +209,12 @@ class DashboardView(APIView):
         groups_inventory_failed = models.Group.objects.filter(inventory_sources__last_job_failed=True).count()
         data['groups'] = {'url': reverse('api:group_list', request=request), 'total': user_groups.count(), 'inventory_failed': groups_inventory_failed}
 
-        user_hosts = get_user_queryset(request.user, models.Host)
-        user_hosts_failed = user_hosts.filter(last_job_host_summary__failed=True)
+        user_hosts = get_user_queryset(request.user, models.Host).exclude(inventory__kind='constructed')
+        latest_summary_failed = Subquery(models.JobHostSummary.objects.filter(host_id=OuterRef('pk')).order_by('-id').values('failed')[:1])
+        user_hosts_failed = user_hosts.annotate(_latest_failed=latest_summary_failed).filter(_latest_failed=True)
+
         data['hosts'] = {
             'url': reverse('api:host_list', request=request),
-            'failures_url': reverse('api:host_list', request=request) + "?last_job_host_summary__failed=True",
             'total': user_hosts.count(),
             'failed': user_hosts_failed.count(),
         }
@@ -378,12 +386,24 @@ class DashboardJobsGraphView(APIView):
 
 
 class InstanceList(ListCreateAPIView):
+    """
+    Creates an instance if used on a Kubernetes or OpenShift deployment of Ansible Automation Platform.
+    """
+
     name = _("Instances")
     model = models.Instance
     serializer_class = serializers.InstanceSerializer
     search_fields = ('hostname',)
     ordering = ('id',)
     resource_purpose = 'instances'
+
+    @extend_schema_if_available(
+        extensions={
+            "x-ai-description": "Register an execution or hop node instance. Only available on openshift based AAP deployments. Use the install bundle playbook to further provision the instance"
+        }
+    )
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         qs = super().get_queryset().prefetch_related('receptor_addresses')
@@ -539,6 +559,14 @@ class InstanceGroupList(ListCreateAPIView):
     serializer_class = serializers.InstanceGroupSerializer
     resource_purpose = 'instance groups'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of instance groups."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Create an instance group. Instances in this group determine where a job will be executed"})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
 
 class InstanceGroupDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
     always_allow_superuser = False
@@ -648,7 +676,7 @@ class SchedulePreview(GenericAPIView):
                     continue
                 schedule.append(event)
 
-            return Response({'local': schedule, 'utc': [s.astimezone(pytz.utc) for s in schedule]})
+            return Response({'local': schedule, 'utc': [s.astimezone(dt_timezone.utc) for s in schedule]})
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -773,22 +801,11 @@ class TeamRolesList(SubListAttachDetachAPIView):
             data = dict(msg=_("You cannot grant system-level permissions to a team."))
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
 
-        team = get_object_or_404(models.Team, pk=self.kwargs['pk'])
-        credential_content_type = ContentType.objects.get_for_model(models.Credential)
-        if role.content_type == credential_content_type:
-            if not role.content_object.organization:
-                data = dict(
-                    msg=_("You cannot grant access to a credential that is not assigned to an organization (private credentials cannot be assigned to teams)")
-                )
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
-            elif role.content_object.organization.id != team.organization.id:
-                if not request.user.is_superuser:
-                    data = dict(
-                        msg=_(
-                            "You cannot grant a team access to a credential in a different organization. Only superusers can grant cross-organization credential access to teams"
-                        )
-                    )
-                    return Response(data, status=status.HTTP_400_BAD_REQUEST)
+        if not request.data.get('disassociate'):
+            team = get_object_or_404(models.Team, pk=self.kwargs['pk'])
+            content_object = role.content_object
+            if hasattr(content_object, 'validate_role_assignment'):
+                content_object.validate_role_assignment(team, role_definition=None, requesting_user=request.user)
 
         return super(TeamRolesList, self).post(request, *args, **kwargs)
 
@@ -868,6 +885,14 @@ class ExecutionEnvironmentList(ListCreateAPIView):
     swagger_topic = "Execution Environments"
     resource_purpose = 'execution environments'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of execution environments."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Create a new execution environment. Once associated with JT/org/etc"})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
 
 class ExecutionEnvironmentDetail(RetrieveUpdateDestroyAPIView):
     always_allow_superuser = False
@@ -890,6 +915,22 @@ class ExecutionEnvironmentDetail(RetrieveUpdateDestroyAPIView):
                 if left != right:
                     raise PermissionDenied(_("Only the 'pull' field can be edited for managed execution environments."))
         return super().update(request, *args, **kwargs)
+
+    @extend_schema_if_available(
+        extensions={"x-ai-description": "Update all fields of an execution environment. All fields must be provided in the request body."}
+    )
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+    @extend_schema_if_available(
+        extensions={"x-ai-description": "Update specific fields of an execution environment. Only the fields you provide will be updated."}
+    )
+    def patch(self, request, *args, **kwargs):
+        return super().patch(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Delete an execution environment."})
+    def delete(self, request, *args, **kwargs):
+        return super().delete(request, *args, **kwargs)
 
 
 class ExecutionEnvironmentJobTemplateList(SubListAPIView):
@@ -920,6 +961,10 @@ class ProjectList(ListCreateAPIView):
     model = models.Project
     serializer_class = serializers.ProjectSerializer
     resource_purpose = 'projects'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of projects."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
 
 class ProjectDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
@@ -1219,19 +1264,12 @@ class UserRolesList(SubListAttachDetachAPIView):
         if not sub_id:
             return super(UserRolesList, self).post(request)
 
-        user = get_object_or_400(models.User, pk=self.kwargs['pk'])
-        role = get_object_or_400(models.Role, pk=sub_id)
-
-        content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
-        credential_content_type = content_types[models.Credential]
-        if role.content_type == credential_content_type:
-            if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
-                data = dict(msg=_("You cannot grant credential access to a user not in the credentials' organization"))
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
-
-            if not role.content_object.organization and not request.user.is_superuser:
-                data = dict(msg=_("You cannot grant private credential access to another user"))
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
+        if not request.data.get('disassociate'):
+            role = get_object_or_400(models.Role, pk=sub_id)
+            user = get_object_or_400(models.User, pk=self.kwargs['pk'])
+            content_object = role.content_object
+            if hasattr(content_object, 'validate_role_assignment'):
+                content_object.validate_role_assignment(user, role_definition=None, requesting_user=request.user)
 
         return super(UserRolesList, self).post(request, *args, **kwargs)
 
@@ -1346,11 +1384,27 @@ class CredentialTypeList(ListCreateAPIView):
     serializer_class = serializers.CredentialTypeSerializer
     resource_purpose = 'credential types'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of credential types"})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Create a new custom credential type"})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
 
 class CredentialTypeDetail(RetrieveUpdateDestroyAPIView):
     model = models.CredentialType
     serializer_class = serializers.CredentialTypeSerializer
     resource_purpose = 'credential type detail'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Update a custom credential type."})
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Update a custom credential type."})
+    def patch(self, request, *args, **kwargs):
+        return super().patch(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1359,6 +1413,10 @@ class CredentialTypeDetail(RetrieveUpdateDestroyAPIView):
         if instance.credentials.exists():
             raise PermissionDenied(detail=_("Credential types that are in use cannot be deleted"))
         return super(CredentialTypeDetail, self).destroy(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Delete a custom credential type. Cannot delete managed types or types currently in use."})
+    def delete(self, request, *args, **kwargs):
+        return super().delete(request, *args, **kwargs)
 
 
 class CredentialTypeCredentialList(SubListCreateAPIView):
@@ -1384,9 +1442,13 @@ class CredentialList(ListCreateAPIView):
     serializer_class = serializers.CredentialSerializerCreate
     resource_purpose = 'credentials'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of credentials"})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
     @extend_schema_if_available(
         extensions={
-            "x-ai-description": "Create a new credential. The `inputs` field contain type-specific input fields. The required fields depend on related `credential_type`. Use GET /v2/credential_types/{id}/ (tool name: controller.credential_types_retrieve) and inspect `inputs` field for the specific credential type's expected schema."
+            "x-ai-description": "Create a new credential. The `inputs` field contain type-specific input fields. The required fields depend on related `credential_type`. Use GET /v2/credential_types/{id}/ (tool name: controller.credential_types_retrieve) and inspect `inputs` field for the specific credential type's expected schema.  The fields `user` and `team` are deprecated and should not be included in the payload."
         }
     )
     def post(self, request, *args, **kwargs):
@@ -1522,7 +1584,175 @@ class CredentialCopy(CopyAPIView):
     resource_purpose = 'copy of a credential'
 
 
-class CredentialExternalTest(SubDetailAPIView):
+class OIDCCredentialTestMixin:
+    """
+    Mixin to add OIDC workload identity token support to credential test endpoints.
+
+    This mixin provides methods to handle OIDC-enabled external credentials that use
+    workload identity tokens for authentication.
+    """
+
+    @staticmethod
+    def _get_workload_identity_token(job_template: models.JobTemplate, audience: str) -> str:
+        """Generate a workload identity token for a job template.
+
+        Args:
+            job_template: The JobTemplate instance to generate claims for
+            audience: The JWT audience claim value
+
+        Returns:
+            str: The generated JWT token
+        """
+        claims = {
+            AutomationControllerJobScope.CLAIM_ORGANIZATION_NAME: job_template.organization.name,
+            AutomationControllerJobScope.CLAIM_ORGANIZATION_ID: job_template.organization.id,
+            AutomationControllerJobScope.CLAIM_PROJECT_NAME: job_template.project.name,
+            AutomationControllerJobScope.CLAIM_PROJECT_ID: job_template.project.id,
+            AutomationControllerJobScope.CLAIM_JOB_TEMPLATE_NAME: job_template.name,
+            AutomationControllerJobScope.CLAIM_JOB_TEMPLATE_ID: job_template.id,
+            AutomationControllerJobScope.CLAIM_PLAYBOOK_NAME: job_template.playbook,
+        }
+        return retrieve_workload_identity_jwt_with_claims(
+            claims=claims,
+            audience=audience,
+            scope=AutomationControllerJobScope.name,
+        )
+
+    @staticmethod
+    def _decode_jwt_payload_for_display(jwt_token):
+        """Decode JWT payload for display purposes only (signature not verified).
+
+        This is safe because the JWT was just created by AWX and is only decoded
+        to show the user what claims are being sent to the external system.
+        The external system will perform proper signature verification.
+
+        Args:
+            jwt_token: The JWT token to decode
+
+        Returns:
+            dict: The decoded JWT payload
+        """
+        return _jwt_decode(jwt_token, algorithms=["RS256"], options={"verify_signature": False})  # NOSONAR python:S5659
+
+    def _has_workload_identity_token(self, credential_type_inputs):
+        """Check if credential type has an internal workload_identity_token field.
+
+        Args:
+            credential_type_inputs: The inputs dict from a credential type
+
+        Returns:
+            bool: True if the credential type has a workload_identity_token field marked as internal
+        """
+        fields = credential_type_inputs.get('fields', []) if isinstance(credential_type_inputs, dict) else []
+        return any(field.get('internal') and field.get('id') == 'workload_identity_token' for field in fields)
+
+    def _validate_and_get_job_template(self, job_template_id):
+        """Validate job template ID and return the JobTemplate instance.
+
+        Args:
+            job_template_id: The job template ID from metadata
+
+        Returns:
+            JobTemplate instance
+
+        Raises:
+            ParseError: If job_template_id is invalid or not found
+        """
+        if job_template_id is None:
+            raise ParseError(_('Job template ID is required.'))
+
+        try:
+            return models.JobTemplate.objects.get(id=int(job_template_id))
+        except ValueError:
+            raise ParseError(_('Job template ID must be an integer.'))
+        except models.JobTemplate.DoesNotExist:
+            raise ParseError(_('Job template with ID %(id)s does not exist.') % {'id': job_template_id})
+
+    def _handle_oidc_credential_test(self, backend_kwargs):
+        """
+        Handle OIDC workload identity token generation for external credential test endpoints.
+
+        This method should only be called when FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED is enabled
+        and the credential type has a workload_identity_token field.
+
+        Args:
+            backend_kwargs: The kwargs dict to pass to the backend (will be modified in place)
+
+        Returns:
+            dict: Response body containing details with the sent JWT payload
+
+        Raises:
+            PermissionDenied: If user lacks access to the job template (re-raised for 403 response)
+
+            All other exceptions are caught and converted to 400 responses with error details.
+
+            Modifies backend_kwargs in place to add workload_identity_token.
+        """
+        # Validate job template
+        job_template_id = backend_kwargs.pop('job_template_id', None)
+        job_template = self._validate_and_get_job_template(job_template_id)
+
+        # Check user access
+        if not self.request.user.can_access(models.JobTemplate, 'start', job_template):
+            raise PermissionDenied(_('You do not have access to job template with id: %(id)s.') % {'id': job_template.id})
+
+        # Generate workload identity token
+        jwt_token = self._get_workload_identity_token(job_template, backend_kwargs.get('url'))
+        backend_kwargs['workload_identity_token'] = jwt_token
+
+        return {'details': {'sent_jwt_payload': self._decode_jwt_payload_for_display(jwt_token)}}
+
+    def _call_backend_with_error_handling(self, plugin, backend_kwargs, response_body):
+        """Call credential backend and handle errors."""
+        try:
+            with set_environ(**settings.AWX_TASK_ENV):
+                plugin.backend(**backend_kwargs)
+                return Response(response_body, status=status.HTTP_202_ACCEPTED)
+        except requests.exceptions.HTTPError as exc:
+            message = self._extract_http_error_message(exc)
+            self._add_error_to_response(response_body, message)
+            return Response(response_body, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            message = self._extract_generic_error_message(exc)
+            self._add_error_to_response(response_body, message)
+            return Response(response_body, status=status.HTTP_400_BAD_REQUEST)
+
+    @staticmethod
+    def _extract_http_error_message(exc):
+        """Extract error message from HTTPError, checking response JSON and text."""
+        message = str(exc)
+        if not hasattr(exc, 'response') or exc.response is None:
+            return message
+
+        try:
+            error_data = exc.response.json()
+            if 'errors' in error_data and error_data['errors']:
+                return ', '.join(error_data['errors'])
+            if 'error' in error_data:
+                return error_data['error']
+        except (ValueError, KeyError):
+            if exc.response.text:
+                return exc.response.text
+        return message
+
+    @staticmethod
+    def _extract_generic_error_message(exc):
+        """Extract error message from exception, handling ConnectTimeoutError specially."""
+        message = str(exc) if str(exc) else exc.__class__.__name__
+        for arg in getattr(exc, 'args', []):
+            if isinstance(getattr(arg, 'reason', None), ConnectTimeoutError):
+                return str(arg.reason)
+        return message
+
+    @staticmethod
+    def _add_error_to_response(response_body, message):
+        """Add error message to both 'detail' and 'details.error_message' fields."""
+        response_body['detail'] = message
+        if 'details' in response_body:
+            response_body['details']['error_message'] = message
+
+
+class CredentialExternalTest(OIDCCredentialTestMixin, SubDetailAPIView):
     """
     Test updates to the input values and metadata of an external credential
     before saving them.
@@ -1535,9 +1765,15 @@ class CredentialExternalTest(SubDetailAPIView):
     obj_permission_type = 'use'
     resource_purpose = 'test external credential'
 
-    @extend_schema_if_available(extensions={"x-ai-description": "Test update the input values and metadata of an external credential"})
+    @extend_schema_if_available(extensions={"x-ai-description": """Test update the input values and metadata of an external credential.
+        This endpoint supports testing credentials that connect to external secret management systems
+        such as CyberArk AIM, CyberArk Conjur, HashiCorp Vault, AWS Secrets Manager, Azure Key Vault,
+        Centrify Vault, Thycotic DevOps Secrets Vault, and GitHub App Installation Access Token Lookup.
+        It does not support standard credential types such as Machine, SCM, and Cloud."""})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
+        if obj.credential_type.kind != 'external':
+            raise ParseError(_('Credential is not testable.'))
         backend_kwargs = {}
         for field_name, value in obj.inputs.items():
             backend_kwargs[field_name] = obj.get_input(field_name)
@@ -1545,20 +1781,22 @@ class CredentialExternalTest(SubDetailAPIView):
             if value != '$encrypted$':
                 backend_kwargs[field_name] = value
         backend_kwargs.update(request.data.get('metadata', {}))
-        try:
-            with set_environ(**settings.AWX_TASK_ENV):
-                obj.credential_type.plugin.backend(**backend_kwargs)
-                return Response({}, status=status.HTTP_202_ACCEPTED)
-        except requests.exceptions.HTTPError as exc:
-            message = 'HTTP {}'.format(exc.response.status_code)
-            return Response({'inputs': message}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as exc:
-            message = exc.__class__.__name__
-            args = getattr(exc, 'args', [])
-            for a in args:
-                if isinstance(getattr(a, 'reason', None), ConnectTimeoutError):
-                    message = str(a.reason)
-            return Response({'inputs': message}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Handle OIDC workload identity token generation if enabled
+        response_body = {}
+        if flag_enabled('FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED') and self._has_workload_identity_token(obj.credential_type.inputs):
+            try:
+                oidc_response_body = self._handle_oidc_credential_test(backend_kwargs)
+                response_body.update(oidc_response_body)
+            except PermissionDenied:
+                raise
+            except Exception as exc:
+                error_message = str(exc.detail) if hasattr(exc, 'detail') else str(exc)
+                response_body['detail'] = error_message
+                response_body['details'] = {'error_message': error_message}
+                return Response(response_body, status=status.HTTP_400_BAD_REQUEST)
+
+        return self._call_backend_with_error_handling(obj.credential_type.plugin, backend_kwargs, response_body)
 
 
 class CredentialInputSourceDetail(RetrieveUpdateDestroyAPIView):
@@ -1588,7 +1826,7 @@ class CredentialInputSourceSubList(SubListCreateAPIView):
     parent_key = 'target_credential'
 
 
-class CredentialTypeExternalTest(SubDetailAPIView):
+class CredentialTypeExternalTest(OIDCCredentialTestMixin, SubDetailAPIView):
     """
     Test a complete set of input values for an external credential before
     saving it.
@@ -1603,21 +1841,26 @@ class CredentialTypeExternalTest(SubDetailAPIView):
     @extend_schema_if_available(extensions={"x-ai-description": "Test a complete set of input values for an external credential"})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
+        if obj.kind != 'external':
+            raise ParseError(_('Credential type is not testable.'))
         backend_kwargs = request.data.get('inputs', {})
         backend_kwargs.update(request.data.get('metadata', {}))
-        try:
-            obj.plugin.backend(**backend_kwargs)
-            return Response({}, status=status.HTTP_202_ACCEPTED)
-        except requests.exceptions.HTTPError as exc:
-            message = 'HTTP {}'.format(exc.response.status_code)
-            return Response({'inputs': message}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as exc:
-            message = exc.__class__.__name__
-            args = getattr(exc, 'args', [])
-            for a in args:
-                if isinstance(getattr(a, 'reason', None), ConnectTimeoutError):
-                    message = str(a.reason)
-            return Response({'inputs': message}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Handle OIDC workload identity token generation if enabled
+        response_body = {}
+        if flag_enabled('FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED') and self._has_workload_identity_token(obj.inputs):
+            try:
+                oidc_response_body = self._handle_oidc_credential_test(backend_kwargs)
+                response_body.update(oidc_response_body)
+            except PermissionDenied:
+                raise
+            except Exception as exc:
+                error_message = str(exc.detail) if hasattr(exc, 'detail') else str(exc)
+                response_body['detail'] = error_message
+                response_body['details'] = {'error_message': error_message}
+                return Response(response_body, status=status.HTTP_400_BAD_REQUEST)
+
+        return self._call_backend_with_error_handling(obj.plugin, backend_kwargs, response_body)
 
 
 class HostRelatedSearchMixin(object):
@@ -1673,13 +1916,17 @@ class HostList(HostRelatedSearchMixin, ListCreateAPIView):
     serializer_class = serializers.HostSerializer
     resource_purpose = 'hosts'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of hosts."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
     def get_queryset(self):
         qs = super(HostList, self).get_queryset()
         filter_string = self.request.query_params.get('host_filter', None)
         if filter_string:
             filter_qs = SmartFilter.query_from_string(filter_string)
             qs &= filter_qs
-        return qs.distinct()
+        return qs.distinct().with_latest_summary_id()
 
     def list(self, *args, **kwargs):
         try:
@@ -1693,6 +1940,9 @@ class HostDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
     model = models.Host
     serializer_class = serializers.HostSerializer
     resource_purpose = 'host detail'
+
+    def get_queryset(self):
+        return super().get_queryset().with_latest_summary_id()
 
     @extend_schema_if_available(extensions={"x-ai-description": "Delete a host"})
     def delete(self, request, *args, **kwargs):
@@ -1726,6 +1976,9 @@ class InventoryHostsList(HostRelatedSearchMixin, SubListCreateAttachDetachAPIVie
     parent_key = 'inventory'
     filter_read_permission = False
     resource_purpose = 'hosts of an inventory'
+
+    def get_queryset(self):
+        return super().get_queryset().with_latest_summary_id()
 
 
 class HostGroupsList(SubListCreateAttachDetachAPIView):
@@ -1816,6 +2069,14 @@ class GroupList(ListCreateAPIView):
     serializer_class = serializers.GroupSerializer
     resource_purpose = 'groups'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of groups."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Create a new group."})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
 
 class EnforceParentRelationshipMixin(object):
     """
@@ -1902,6 +2163,9 @@ class GroupHostsList(HostRelatedSearchMixin, SubListCreateAttachDetachAPIView):
     relationship = 'hosts'
     resource_purpose = 'hosts of a group'
 
+    def get_queryset(self):
+        return super().get_queryset().with_latest_summary_id()
+
     def update_raw_data(self, data):
         data.pop('inventory', None)
         return super(GroupHostsList, self).update_raw_data(data)
@@ -1933,7 +2197,7 @@ class GroupAllHostsList(HostRelatedSearchMixin, SubListAPIView):
         self.check_parent_access(parent)
         qs = self.request.user.get_queryset(self.model).distinct()  # need distinct for '&' operator
         sublist_qs = parent.all_hosts.distinct()
-        return qs & sublist_qs
+        return (qs & sublist_qs).with_latest_summary_id()
 
 
 class GroupInventorySourcesList(SubListAPIView):
@@ -2014,6 +2278,10 @@ class HostVariableData(BaseVariableData):
     model = models.Host
     serializer_class = serializers.HostVariableDataSerializer
     resource_purpose = 'variable data for a host'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "The extra variable configuration for this host."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
 
 class GroupVariableData(BaseVariableData):
@@ -2222,6 +2490,9 @@ class InventorySourceHostsList(HostRelatedSearchMixin, SubListDestroyAPIView):
     check_sub_obj_permission = False
     resource_purpose = 'hosts of an inventory source'
 
+    def get_queryset(self):
+        return super().get_queryset().with_latest_summary_id()
+
     def perform_list_destroy(self, instance_list):
         inv_source = self.get_parent_object()
         with ignore_inventory_computed_fields():
@@ -2302,7 +2573,7 @@ class InventorySourceUpdateView(RetrieveAPIView):
     serializer_class = serializers.InventorySourceUpdateSerializer
     resource_purpose = 'update an inventory source'
 
-    @extend_schema_if_available(extensions={"x-ai-description": "Update inventory source"})
+    @extend_schema_if_available(extensions={"x-ai-description": "Sync the inventory source"})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
         serializer = self.get_serializer(instance=obj, data=request.data)
@@ -2362,6 +2633,10 @@ class JobTemplateList(ListCreateAPIView):
     always_allow_superuser = False
     resource_purpose = 'job templates'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of job templates."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
     def check_permissions(self, request):
         if request.method == 'POST':
             if request.user.is_anonymous:
@@ -2381,6 +2656,11 @@ class JobTemplateDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIV
     resource_purpose = 'job template detail'
 
 
+@extend_schema_view(
+    retrieve=extend_schema(
+        extensions={'x-ai-description': 'List job template launch criteria'},
+    )
+)
 class JobTemplateLaunch(RetrieveAPIView):
     model = models.JobTemplate
     obj_permission_type = 'start'
@@ -2389,6 +2669,9 @@ class JobTemplateLaunch(RetrieveAPIView):
     resource_purpose = 'launch a job from a job template'
 
     def update_raw_data(self, data):
+        """
+        Use the ID of a job template to retrieve its launch details.
+        """
         try:
             obj = self.get_object()
         except PermissionDenied:
@@ -2439,9 +2722,7 @@ class JobTemplateLaunch(RetrieveAPIView):
 
         return modern_data
 
-    @extend_schema_if_available(
-        extensions={'x-ai-description': 'Launch a job'},
-    )
+    @extend_schema_if_available(extensions={"x-ai-description": "Launch the job template"})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
 
@@ -3140,6 +3421,10 @@ class WorkflowJobTemplateList(ListCreateAPIView):
     always_allow_superuser = False
     resource_purpose = 'workflow job templates'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of workflow job templates."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
     def check_permissions(self, request):
         if request.method == 'POST':
             if request.user.is_anonymous:
@@ -3220,6 +3505,11 @@ class WorkflowJobTemplateLabelList(JobTemplateLabelList):
     resource_purpose = 'labels of a workflow job template'
 
 
+@extend_schema_view(
+    retrieve=extend_schema(
+        extensions={'x-ai-description': 'List workflow job template launch criteria.'},
+    )
+)
 class WorkflowJobTemplateLaunch(RetrieveAPIView):
     model = models.WorkflowJobTemplate
     obj_permission_type = 'start'
@@ -3228,6 +3518,9 @@ class WorkflowJobTemplateLaunch(RetrieveAPIView):
     resource_purpose = 'launch a workflow job from a workflow job template'
 
     def update_raw_data(self, data):
+        """
+        Use the ID of a workflow job template to retrieve its launch details.
+        """
         try:
             obj = self.get_object()
         except PermissionDenied:
@@ -3253,9 +3546,7 @@ class WorkflowJobTemplateLaunch(RetrieveAPIView):
 
         return data
 
-    @extend_schema_if_available(
-        extensions={'x-ai-description': 'Launch a workflow job'},
-    )
+    @extend_schema_if_available(extensions={"x-ai-description": "Launch the workflow job template."})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
 
@@ -3297,9 +3588,7 @@ class WorkflowJobRelaunch(GenericAPIView):
     def get(self, request, *args, **kwargs):
         return Response({})
 
-    @extend_schema_if_available(
-        extensions={'x-ai-description': 'Relaunch a workflow job'},
-    )
+    @extend_schema_if_available(extensions={"x-ai-description": "Relaunch a workflow job"})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
         if obj.is_sliced_job:
@@ -3416,6 +3705,10 @@ class WorkflowJobList(ListAPIView):
     serializer_class = serializers.WorkflowJobListSerializer
     resource_purpose = 'workflow jobs'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of workflow jobs."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
 
 class WorkflowJobDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
     model = models.WorkflowJob
@@ -3441,7 +3734,7 @@ class WorkflowJobCancel(GenericCancelView):
     serializer_class = serializers.WorkflowJobCancelSerializer
     resource_purpose = 'cancel for a workflow job'
 
-    @extend_schema_if_available(extensions={"x-ai-description": "Cancel a workflow job"})
+    @extend_schema_if_available(extensions={"x-ai-description": "Cancel a running or pending workflow job"})
     def post(self, request, *args, **kwargs):
         r = super().post(request, *args, **kwargs)
         ScheduleWorkflowManager().schedule()
@@ -3562,6 +3855,10 @@ class JobList(ListAPIView):
     serializer_class = serializers.JobListSerializer
     resource_purpose = 'jobs'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of jobs."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
 
 class JobDetail(UnifiedJobDeletionMixin, RetrieveDestroyAPIView):
     model = models.Job
@@ -3611,7 +3908,16 @@ class JobCancel(GenericCancelView):
     serializer_class = serializers.JobCancelSerializer
     resource_purpose = 'cancel for a job'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "Cancel a running or pending job"})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
+
+@extend_schema_view(
+    retrieve=extend_schema(
+        extensions={'x-ai-description': 'List job relaunch criteria'},
+    )
+)
 class JobRelaunch(RetrieveAPIView):
     model = models.Job
     obj_permission_type = 'start'
@@ -3619,6 +3925,7 @@ class JobRelaunch(RetrieveAPIView):
     resource_purpose = 'relaunch a job'
 
     def update_raw_data(self, data):
+        """Use the ID of a job to retrieve data on retry attempts and necessary passwords."""
         data = super(JobRelaunch, self).update_raw_data(data)
         try:
             obj = self.get_object()
@@ -3645,9 +3952,7 @@ class JobRelaunch(RetrieveAPIView):
                 self.permission_denied(request, message=messages['detail'])
         return super(JobRelaunch, self).check_object_permissions(request, obj)
 
-    @extend_schema_if_available(
-        extensions={'x-ai-description': 'Relaunch a job'},
-    )
+    @extend_schema_if_available(extensions={"x-ai-description": "Relaunch a job"})
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
         context = self.get_serializer_context()
@@ -3943,6 +4248,10 @@ class JobJobEventsChildrenSummary(APIView):
 
         prev_non_meta_event = events[0]
         for i, e in enumerate(events):
+            if not e['event']:
+                logging.warning(f'event type missing for event {e}')
+                continue
+
             if not e['event'] in JobJobEventsChildrenSummary.meta_events:
                 prev_non_meta_event = e
             if not e['uuid']:
@@ -3980,9 +4289,11 @@ class JobJobEventsChildrenSummary(APIView):
                 z = i
                 next_non_meta_event = events[-1]
                 while z < len(events):
-                    if events[z]['event'] not in JobJobEventsChildrenSummary.meta_events:
+                    if events[z]['event'] not in JobJobEventsChildrenSummary.meta_events + ('',):
                         next_non_meta_event = events[z]
                         break
+                    elif not events[z]['event']:
+                        logging.warning(f"JobEventChildrenSummary: job event 'event' field is unexpectedly empty for job {job.id}")
                     z += 1
                 event_level_after = models.JobEvent.LEVEL_FOR_EVENT[next_non_meta_event['event']]
                 if event_level_after and event_level_after > event_level_before:
@@ -4391,6 +4702,10 @@ class JobStdout(UnifiedJobStdout):
     model = models.Job
     resource_purpose = 'stdout output of a job'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "Get the standard output for the selected job."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
 
 class AdHocCommandStdout(UnifiedJobStdout):
     model = models.AdHocCommand
@@ -4402,11 +4717,27 @@ class NotificationTemplateList(ListCreateAPIView):
     serializer_class = serializers.NotificationTemplateSerializer
     resource_purpose = 'notification templates'
 
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of notification templates."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Create a new notification template."})
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
+
 
 class NotificationTemplateDetail(RetrieveUpdateDestroyAPIView):
     model = models.NotificationTemplate
     serializer_class = serializers.NotificationTemplateSerializer
     resource_purpose = 'notification template detail'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Update a notification template."})
+    def put(self, request, *args, **kwargs):
+        return super().put(request, *args, **kwargs)
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Update a notification template."})
+    def patch(self, request, *args, **kwargs):
+        return super().patch(request, *args, **kwargs)
 
     @extend_schema_if_available(extensions={"x-ai-description": "Delete a notification template"})
     def delete(self, request, *args, **kwargs):
@@ -4487,6 +4818,14 @@ class ActivityStreamList(SimpleListAPIView):
     search_fields = ('changes',)
     resource_purpose = 'audit trail entries for tracking system changes'
 
+    @extend_schema_if_available(
+        extensions={
+            "x-ai-description": "A list of activity stream entries. An activity stream entry tracks actions or changes that were previously made to the system."
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
 
 class ActivityStreamDetail(RetrieveAPIView):
     model = models.ActivityStream
@@ -4531,19 +4870,12 @@ class RoleUsersList(SubListAttachDetachAPIView):
         if not sub_id:
             return super(RoleUsersList, self).post(request)
 
-        user = get_object_or_400(models.User, pk=sub_id)
-        role = self.get_parent_object()
-
-        content_types = ContentType.objects.get_for_models(models.Organization, models.Team, models.Credential)  # dict of {model: content_type}
-        credential_content_type = content_types[models.Credential]
-        if role.content_type == credential_content_type:
-            if 'disassociate' not in request.data and role.content_object.organization and user not in role.content_object.organization.member_role:
-                data = dict(msg=_("You cannot grant credential access to a user not in the credentials' organization"))
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
-
-            if not role.content_object.organization and not request.user.is_superuser:
-                data = dict(msg=_("You cannot grant private credential access to another user"))
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
+        if not request.data.get('disassociate'):
+            user = get_object_or_400(models.User, pk=sub_id)
+            role = self.get_parent_object()
+            content_object = role.content_object
+            if hasattr(content_object, 'validate_role_assignment'):
+                content_object.validate_role_assignment(user, role_definition=None, requesting_user=request.user)
 
         return super(RoleUsersList, self).post(request, *args, **kwargs)
 
@@ -4576,24 +4908,6 @@ class RoleTeamsList(SubListAttachDetachAPIView):
             data = dict(msg=_("You cannot assign an Organization participation role as a child role for a Team."))
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
 
-        credential_content_type = ContentType.objects.get_for_model(models.Credential)
-        if role.content_type == credential_content_type:
-            # Private credentials (no organization) are never allowed for teams
-            if not role.content_object.organization:
-                data = dict(
-                    msg=_("You cannot grant access to a credential that is not assigned to an organization (private credentials cannot be assigned to teams)")
-                )
-                return Response(data, status=status.HTTP_400_BAD_REQUEST)
-            # Cross-organization credentials are only allowed for superusers
-            elif role.content_object.organization.id != team.organization.id:
-                if not request.user.is_superuser:
-                    data = dict(
-                        msg=_(
-                            "You cannot grant a team access to a credential in a different organization. Only superusers can grant cross-organization credential access to teams"
-                        )
-                    )
-                    return Response(data, status=status.HTTP_400_BAD_REQUEST)
-
         action = 'attach'
         if request.data.get('disassociate', None):
             action = 'unattach'
@@ -4601,6 +4915,11 @@ class RoleTeamsList(SubListAttachDetachAPIView):
         if role.is_singleton() and action == 'attach':
             data = dict(msg=_("You cannot grant system-level permissions to a team."))
             return Response(data, status=status.HTTP_400_BAD_REQUEST)
+
+        if action == 'attach':
+            content_object = role.content_object
+            if hasattr(content_object, 'validate_role_assignment'):
+                content_object.validate_role_assignment(team, role_definition=None, requesting_user=request.user)
 
         if not request.user.can_access(self.parent_model, action, role, team, self.relationship, request.data, skip_sub_obj_read_check=False):
             raise PermissionDenied()

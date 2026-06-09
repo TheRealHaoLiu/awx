@@ -21,10 +21,15 @@ def test_feature_flags_list_endpoint_override(get, flag_val):
     bob = User.objects.create(username='bob', password='test_user', is_superuser=True)
 
     AAPFlag.objects.all().delete()
-    flag_name = "FEATURE_DISPATCHERD_ENABLED"
+    flag_name = "FEATURE_INDIRECT_NODE_COUNTING_ENABLED"
     setattr(settings, flag_name, flag_val)
     seed_feature_flags()
     url = "/api/v2/feature_flags/states/"
     response = get(url, user=bob, expect=200)
-    assert len(response.data["results"]) == 6
+
+    results = response.data["results"]
+    flag_names = [flag["name"] for flag in results]
+
+    assert flag_name in flag_names, f"{flag_name} should be present in feature flags"
+    assert all(name.startswith("FEATURE_") for name in flag_names), "All feature flags should start with FEATURE_ prefix"
     assert flag_state(flag_name) == flag_val

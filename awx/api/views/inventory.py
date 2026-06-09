@@ -45,7 +45,6 @@ from awx.api.views.mixin import RelatedJobsPreventDeleteMixin
 
 from awx.api.pagination import UnifiedJobEventPagination
 
-
 logger = logging.getLogger('awx.api.views.organization')
 
 
@@ -73,6 +72,10 @@ class InventoryList(ListCreateAPIView):
     model = Inventory
     serializer_class = InventorySerializer
     resource_purpose = 'inventories'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of inventories."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
 
 class InventoryDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):

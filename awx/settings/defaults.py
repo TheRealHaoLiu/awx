@@ -7,7 +7,6 @@ import os
 import re  # noqa
 import tempfile
 import socket
-from datetime import timedelta
 
 DEBUG = True
 SQL_DEBUG = DEBUG
@@ -216,6 +215,9 @@ LOCAL_STDOUT_EXPIRE_TIME = 2592000
 # events into the database
 JOB_EVENT_WORKERS = 4
 
+# Minimum number of workers for the dispatcher (dispatcherd) process pool
+DISPATCHER_MIN_WORKERS = 4
+
 # The number of seconds to buffer callback receiver bulk
 # writes in memory before flushing via JobEvent.objects.bulk_create()
 JOB_EVENT_BUFFER_SECONDS = 1
@@ -416,55 +418,37 @@ EXECUTION_NODE_REMEDIATION_CHECKS = 60 * 30  # once every 30 minutes check if an
 # Amount of time dispatcher will try to reconnect to database for jobs and consuming new work
 DISPATCHER_DB_DOWNTIME_TOLERANCE = 40
 
-# If you set this, nothing will ever be sent to pg_notify
-# this is not practical to use, although periodic schedules may still run slugish but functional tasks
-# sqlite3 based tests will use this
-DISPATCHER_MOCK_PUBLISH = False
-
-# Debugging sockfile for the --status command
-DISPATCHERD_DEBUGGING_SOCKFILE = os.path.join(BASE_DIR, 'dispatcherd.sock')
-
 BROKER_URL = 'unix:///var/run/redis/redis.sock'
 REDIS_RETRY_COUNT = 3  # Number of retries for Redis connection errors
 REDIS_BACKOFF_CAP = 1.0  # Maximum backoff delay in seconds for Redis retries
 REDIS_BACKOFF_BASE = 0.5  # Base for exponential backoff calculation for Redis retries
-CELERYBEAT_SCHEDULE = {
-    'tower_scheduler': {'task': 'awx.main.tasks.system.awx_periodic_scheduler', 'schedule': timedelta(seconds=30), 'options': {'expires': 20}},
-    'cluster_heartbeat': {
+
+DISPATCHER_SCHEDULE = {
+    'awx.main.tasks.system.awx_periodic_scheduler': {'task': 'awx.main.tasks.system.awx_periodic_scheduler', 'schedule': 30, 'options': {'expires': 20}},
+    'awx.main.tasks.system.cluster_node_heartbeat': {
         'task': 'awx.main.tasks.system.cluster_node_heartbeat',
-        'schedule': timedelta(seconds=CLUSTER_NODE_HEARTBEAT_PERIOD),
+        'schedule': CLUSTER_NODE_HEARTBEAT_PERIOD,
         'options': {'expires': 50},
     },
-    'gather_analytics': {'task': 'awx.main.tasks.system.gather_analytics', 'schedule': timedelta(minutes=5)},
-    'task_manager': {'task': 'awx.main.scheduler.tasks.task_manager', 'schedule': timedelta(seconds=20), 'options': {'expires': 20}},
-    'dependency_manager': {'task': 'awx.main.scheduler.tasks.dependency_manager', 'schedule': timedelta(seconds=20), 'options': {'expires': 20}},
-    'k8s_reaper': {'task': 'awx.main.tasks.system.awx_k8s_reaper', 'schedule': timedelta(seconds=60), 'options': {'expires': 50}},
-    'receptor_reaper': {'task': 'awx.main.tasks.system.awx_receptor_workunit_reaper', 'schedule': timedelta(seconds=60)},
-    'send_subsystem_metrics': {'task': 'awx.main.analytics.analytics_tasks.send_subsystem_metrics', 'schedule': timedelta(seconds=20)},
-    'cleanup_images': {'task': 'awx.main.tasks.system.cleanup_images_and_files', 'schedule': timedelta(hours=3)},
-    'cleanup_host_metrics': {'task': 'awx.main.tasks.host_metrics.cleanup_host_metrics', 'schedule': timedelta(hours=3, minutes=30)},
-    'host_metric_summary_monthly': {'task': 'awx.main.tasks.host_metrics.host_metric_summary_monthly', 'schedule': timedelta(hours=4)},
-    'periodic_resource_sync': {'task': 'awx.main.tasks.system.periodic_resource_sync', 'schedule': timedelta(minutes=15)},
-    'cleanup_and_save_indirect_host_entries_fallback': {
+    'awx.main.tasks.system.gather_analytics': {'task': 'awx.main.tasks.system.gather_analytics', 'schedule': 300},
+    'awx.main.scheduler.tasks.task_manager': {'task': 'awx.main.scheduler.tasks.task_manager', 'schedule': 20, 'options': {'expires': 20}},
+    'awx.main.scheduler.tasks.dependency_manager': {'task': 'awx.main.scheduler.tasks.dependency_manager', 'schedule': 20, 'options': {'expires': 20}},
+    'awx.main.tasks.system.awx_k8s_reaper': {'task': 'awx.main.tasks.system.awx_k8s_reaper', 'schedule': 60, 'options': {'expires': 50}},
+    'awx.main.tasks.system.awx_receptor_workunit_reaper': {'task': 'awx.main.tasks.system.awx_receptor_workunit_reaper', 'schedule': 60},
+    'awx.main.analytics.analytics_tasks.send_subsystem_metrics': {'task': 'awx.main.analytics.analytics_tasks.send_subsystem_metrics', 'schedule': 20},
+    'awx.main.tasks.system.cleanup_images_and_files': {'task': 'awx.main.tasks.system.cleanup_images_and_files', 'schedule': 10800},
+    'awx.main.tasks.host_metrics.cleanup_host_metrics': {'task': 'awx.main.tasks.host_metrics.cleanup_host_metrics', 'schedule': 12600},
+    'awx.main.tasks.host_metrics.host_metric_summary_monthly': {'task': 'awx.main.tasks.host_metrics.host_metric_summary_monthly', 'schedule': 14400},
+    'awx.main.tasks.system.periodic_resource_sync': {'task': 'awx.main.tasks.system.periodic_resource_sync', 'schedule': 900},
+    'awx.main.tasks.host_indirect.cleanup_and_save_indirect_host_entries_fallback': {
         'task': 'awx.main.tasks.host_indirect.cleanup_and_save_indirect_host_entries_fallback',
-        'schedule': timedelta(minutes=60),
+        'schedule': 3600,
     },
 }
 
-DISPATCHER_SCHEDULE = {}
-for options in CELERYBEAT_SCHEDULE.values():
-    new_options = options.copy()
-    task_name = options['task']
-    # Handle the only one exception case of the heartbeat which has a new implementation
-    if task_name == 'awx.main.tasks.system.cluster_node_heartbeat':
-        task_name = 'awx.main.tasks.system.adispatch_cluster_node_heartbeat'
-        new_options['task'] = task_name
-    new_options['schedule'] = options['schedule'].total_seconds()
-    DISPATCHER_SCHEDULE[task_name] = new_options
-
 # Django Caching Configuration
 DJANGO_REDIS_IGNORE_EXCEPTIONS = True
-CACHES = {'default': {'BACKEND': 'awx.main.cache.AWXRedisCache', 'LOCATION': 'unix:///var/run/redis/redis.sock?db=1'}}
+CACHES = {'default': {'BACKEND': 'ansible_base.lib.cache.redis_cache.DABRedisCache', 'LOCATION': 'unix:///var/run/redis/redis.sock?db=1'}}
 
 ROLE_SINGLETON_USER_RELATIONSHIP = ''
 ROLE_SINGLETON_TEAM_RELATIONSHIP = ''
@@ -556,6 +540,9 @@ INSIGHTS_TRACKING_STATE = False
 AUTOMATION_ANALYTICS_LAST_GATHER = None
 # Last gathered entries for expensive Analytics
 AUTOMATION_ANALYTICS_LAST_ENTRIES = ''
+
+# Candlepin integration settings for analytics authentication
+AWX_ANALYTICS_CANDLEPIN_URL = 'https://subscription.rhsm.redhat.com/subscription/'
 
 # Default list of modules allowed for ad hoc commands.
 # Note: This setting may be overridden by database settings.
@@ -719,7 +706,6 @@ DISABLE_LOCAL_AUTH = False
 TOWER_URL_BASE = "https://platformhost"
 
 INSIGHTS_URL_BASE = "https://example.org"
-INSIGHTS_OIDC_ENDPOINT = "https://sso.example.org/"
 INSIGHTS_AGENT_MIME = 'application/example'
 # See https://github.com/ansible/awx-facts-playbooks
 INSIGHTS_SYSTEM_ID_FILE = '/etc/redhat-access-insights/machine-id'
@@ -794,7 +780,7 @@ LOGGING = {
         'awx.conf.settings': {'handlers': ['null'], 'level': 'WARNING'},
         'awx.main': {'handlers': ['null']},
         'awx.main.commands.run_callback_receiver': {'handlers': ['callback_receiver'], 'level': 'INFO'},  # very noisey debug-level logs
-        'awx.main.dispatch': {'handlers': ['dispatcher']},
+        'awx.main.dispatch': {'handlers': ['task_system']},
         'awx.main.consumers': {'handlers': ['console', 'file', 'tower_warnings'], 'level': 'INFO'},
         'awx.main.rsyslog_configurer': {'handlers': ['rsyslog_configurer']},
         'awx.main.cache_clear': {'handlers': ['cache_clear']},
@@ -1035,7 +1021,6 @@ METRICS_SUBSYSTEM_CONFIG = {
 ANSIBLE_BASE_TEAM_MODEL = 'main.Team'
 ANSIBLE_BASE_ORGANIZATION_MODEL = 'main.Organization'
 ANSIBLE_BASE_RESOURCE_CONFIG_MODULE = 'awx.resource_api'
-ANSIBLE_BASE_PERMISSION_MODEL = 'main.Permission'
 
 # Defaults to be overridden by DAB
 SPECTACULAR_SETTINGS = {
@@ -1047,12 +1032,14 @@ SPECTACULAR_SETTINGS = {
     'SCHEMA_PATH_PREFIX': r'/api/v[0-9]',
     'DEFAULT_GENERATOR_CLASS': 'drf_spectacular.generators.SchemaGenerator',
     'SCHEMA_COERCE_PATH_PK_SUFFIX': True,
-    'CONTACT': {'email': 'controller-eng@redhat.com'},
+    'CONTACT': {'email': 'ansible-community@redhat.com'},
     'LICENSE': {'name': 'Apache License'},
     'TERMS_OF_SERVICE': 'https://www.google.com/policies/terms/',
     # Use our custom schema class that handles swagger_topic and deprecated views
     'DEFAULT_SCHEMA_CLASS': 'awx.api.schema.CustomAutoSchema',
     'COMPONENT_SPLIT_REQUEST': True,
+    # Postprocessing hook to filter CredentialType enum values
+    'POSTPROCESSING_HOOKS': ['awx.api.schema.filter_credential_type_schema'],
     'SWAGGER_UI_SETTINGS': {
         'deepLinking': True,
         'persistAuthorization': True,
@@ -1153,7 +1140,7 @@ OPA_REQUEST_RETRIES = 2  # The number of retry attempts for connecting to the OP
 
 # feature flags
 FEATURE_INDIRECT_NODE_COUNTING_ENABLED = False
-FEATURE_DISPATCHERD_ENABLED = False
+FEATURE_OIDC_WORKLOAD_IDENTITY_ENABLED = False
 
 # Dispatcher worker lifetime. If set to None, workers will never be retired
 # based on age. Note workers will finish their last task before retiring if

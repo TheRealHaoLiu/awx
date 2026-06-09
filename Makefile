@@ -1,6 +1,6 @@
 -include awx/ui/Makefile
 
-PYTHON := $(notdir $(shell for i in python3.11 python3; do command -v $$i; done|sed 1q))
+PYTHON := $(notdir $(shell for i in python3.12 python3.11 python3; do command -v $$i; done|sed 1q))
 SHELL := bash
 DOCKER_COMPOSE ?= docker compose
 OFFICIAL ?= no
@@ -10,6 +10,7 @@ KIND_BIN ?= $(shell which kind)
 CHROMIUM_BIN=/tmp/chrome-linux/chrome
 GIT_REPO_NAME ?= $(shell basename `git rev-parse --show-toplevel`)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
+GIT_IS_WORKTREE := $(shell test -f .git && echo yes)
 MANAGEMENT_COMMAND ?= awx-manage
 VERSION ?= $(shell $(PYTHON) tools/scripts/scm_version.py 2> /dev/null)
 
@@ -79,7 +80,7 @@ RECEPTOR_IMAGE ?= quay.io/ansible/receptor:devel
 SRC_ONLY_PKGS ?= cffi,pycparser,psycopg,twilio
 # These should be upgraded in the AWX and Ansible venv before attempting
 # to install the actual requirements
-VENV_BOOTSTRAP ?= pip==21.2.4 setuptools==80.9.0 setuptools_scm[toml]==8.0.4 wheel==0.42.0 cython==3.1.3
+VENV_BOOTSTRAP ?= pip==25.3 setuptools==80.9.0 setuptools_scm[toml]==9.2.2 wheel==0.46.3 cython==3.1.3
 
 NAME ?= awx
 
@@ -106,12 +107,23 @@ else
  DOCKER_KUBE_CACHE_FLAG=$(DOCKER_CACHE)
 endif
 
+# AWX TUI variables
+AWX_HOST ?= https://localhost:8043
+AWX_USER ?= admin
+AWX_PASSWORD ?= $$(awk -F"'" '/^admin_password:/{print $$2}' tools/docker-compose/_sources/secrets/admin_password.yml 2>/dev/null || echo "admin")
+AWX_VERIFY_SSL ?= false
+
+# For git worktree to find the referenced git dir
+GIT_COMMON_DIR := $(shell git rev-parse --git-common-dir 2>/dev/null || echo .git)
+
 .PHONY: awx-link clean clean-tmp clean-venv requirements requirements_dev \
+	update_requirements upgrade_requirements update_requirements_dev \
+	docker_update_requirements docker_upgrade_requirements docker_update_requirements_dev \
 	develop refresh adduser migrate dbchange \
 	receiver test test_unit test_coverage coverage_html \
 	sdist \
 	VERSION PYTHON_VERSION docker-compose-sources \
-	.git/hooks/pre-commit
+	pre-commit
 
 clean-tmp:
 	rm -rf tmp/
@@ -146,7 +158,7 @@ clean-api:
 	rm -rf build $(NAME)-$(VERSION) *.egg-info
 	rm -rf .tox
 	find . -type f -regex ".*\.py[co]$$" -delete
-	find . -type d -name "__pycache__" -delete
+	find . -type d -name "__pycache__" -exec rm -rf {} +
 	rm -f awx/awx_test.sqlite3*
 	rm -rf requirements/vendor
 	rm -rf awx/projects
@@ -195,6 +207,36 @@ requirements: requirements_awx
 requirements_dev: requirements_awx requirements_awx_dev
 
 requirements_test: requirements
+
+## Update requirements files using pip-compile (run inside container)
+update_requirements:
+	cd requirements && ./updater.sh run
+
+## Upgrade all requirements to latest versions (run inside container)
+upgrade_requirements:
+	cd requirements && ./updater.sh upgrade
+
+## Update development requirements (run inside container)
+update_requirements_dev:
+	cd requirements && ./updater.sh dev
+
+## Update requirements using docker-runner
+docker_update_requirements:
+	@echo "Running requirements updater..."
+	AWX_DOCKER_CMD='make update_requirements' $(MAKE) docker-runner
+	@echo "Requirements update complete!"
+
+## Upgrade requirements using docker-runner
+docker_upgrade_requirements:
+	@echo "Running requirements upgrader..."
+	AWX_DOCKER_CMD='make upgrade_requirements' $(MAKE) docker-runner
+	@echo "Requirements upgrade complete!"
+
+## Update dev requirements using docker-runner
+docker_update_requirements_dev:
+	@echo "Running dev requirements updater..."
+	AWX_DOCKER_CMD='make update_requirements_dev' $(MAKE) docker-runner
+	@echo "Dev requirements update complete!"
 
 ## "Install" awx package in development mode.
 develop:
@@ -257,7 +299,7 @@ dispatcher:
 	@if [ "$(VENV_BASE)" ]; then \
 		. $(VENV_BASE)/awx/bin/activate; \
 	fi; \
-	$(PYTHON) manage.py run_dispatcher
+	$(PYTHON) manage.py dispatcherd
 
 ## Run to start the zeromq callback receiver
 receiver:
@@ -310,11 +352,10 @@ black: reports
 	@command -v black >/dev/null 2>&1 || { echo "could not find black on your PATH, you may need to \`pip install black\`, or set AWX_IGNORE_BLACK=1" && exit 1; }
 	@(set -o pipefail && $@ $(BLACK_ARGS) awx awxkit awx_collection | tee reports/$@.report)
 
-.git/hooks/pre-commit:
-	@echo "if [ -x pre-commit.sh ]; then" > .git/hooks/pre-commit
-	@echo "    ./pre-commit.sh;" >> .git/hooks/pre-commit
-	@echo "fi" >> .git/hooks/pre-commit
-	@chmod +x .git/hooks/pre-commit
+$(GIT_COMMON_DIR)/hooks/pre-commit:
+	ln -sf ../../pre-commit.sh $(GIT_COMMON_DIR)/hooks/pre-commit
+
+pre-commit: $(GIT_COMMON_DIR)/hooks/pre-commit
 
 genschema: awx-link reports
 	@if [ "$(VENV_BASE)" ]; then \
@@ -489,7 +530,7 @@ ifneq ($(ADMIN_PASSWORD),)
 	EXTRA_SOURCES_ANSIBLE_OPTS := -e admin_password=$(ADMIN_PASSWORD) $(EXTRA_SOURCES_ANSIBLE_OPTS)
 endif
 
-docker-compose-sources: .git/hooks/pre-commit
+docker-compose-sources:
 	@if [ $(MINIKUBE_CONTAINER_GROUP) = true ]; then\
 	    $(ANSIBLE_PLAYBOOK) -i tools/docker-compose/inventory -e minikube_setup=$(MINIKUBE_SETUP) tools/docker-compose-minikube/deploy.yml; \
 	fi;
@@ -521,7 +562,7 @@ docker-compose: awx/projects docker-compose-sources
 	$(MAKE) docker-compose-up
 
 docker-compose-up:
-	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml $(COMPOSE_OPTS) up $(COMPOSE_UP_OPTS) --remove-orphans
+	$(if $(GIT_IS_WORKTREE),SETUPTOOLS_SCM_PRETEND_VERSION="$(VERSION)") $(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml $(COMPOSE_OPTS) up $(COMPOSE_UP_OPTS) --remove-orphans
 
 docker-compose-down:
 	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml $(COMPOSE_OPTS) down --remove-orphans
@@ -539,6 +580,20 @@ docker-compose-runtest: awx/projects docker-compose-sources
 docker-compose-build-schema: awx/projects docker-compose-sources
 	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml run --rm --service-ports --no-deps awx_1 make genschema
 
+awx-tui:
+	@if ! command -v awx-tui > /dev/null 2>&1; then \
+		$(PYTHON) -m pip install awx-tui; \
+	fi
+	@if [ -f "$(HOME)/.config/awx-tui/config.yaml" ]; then \
+		$(PYTHON) -m awx_tui.main; \
+	else \
+		AWX_HOST=$(AWX_HOST) \
+		AWX_USER=$(AWX_USER) \
+		AWX_PASSWORD=$(AWX_PASSWORD) \
+		AWX_VERIFY_SSL=$(AWX_VERIFY_SSL) \
+		$(PYTHON) -m awx_tui.main --host $(AWX_HOST); \
+	fi
+
 SCHEMA_DIFF_BASE_FOLDER ?= awx
 SCHEMA_DIFF_BASE_BRANCH ?= devel
 detect-schema-change: genschema
@@ -546,6 +601,10 @@ detect-schema-change: genschema
 	# Ignore differences in whitespace with -b
 	# diff exits with 1 when files differ - capture but don't fail
 	-diff -u -b reference-schema.json schema.json
+
+validate-openapi-schema: genschema
+	@echo "Validating OpenAPI schema from schema.json..."
+	@python3 -c "from openapi_spec_validator import validate; import json; spec = json.load(open('schema.json')); validate(spec); print('✓ Schema is valid')"
 
 docker-compose-clean: awx/projects
 	$(DOCKER_COMPOSE) -f tools/docker-compose/_sources/docker-compose.yml rm -sf
@@ -578,7 +637,7 @@ docker-compose-build: Dockerfile.dev
 docker-compose-buildx: Dockerfile.dev
 	- docker buildx create --name docker-compose-buildx
 	docker buildx use docker-compose-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \
@@ -638,7 +697,7 @@ awx-kube-build: Dockerfile
 awx-kube-buildx: Dockerfile
 	- docker buildx create --name awx-kube-buildx
 	docker buildx use awx-kube-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg VERSION=$(VERSION) \
@@ -672,7 +731,7 @@ awx-kube-dev-build: Dockerfile.kube-dev
 awx-kube-dev-buildx: Dockerfile.kube-dev
 	- docker buildx create --name awx-kube-dev-buildx
 	docker buildx use awx-kube-dev-buildx
-	- docker buildx build \
+	docker buildx build \
 		--ssh default=$(SSH_AUTH_SOCK) \
 		--push \
 		--build-arg BUILDKIT_INLINE_CACHE=1 \

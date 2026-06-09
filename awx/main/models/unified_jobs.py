@@ -10,10 +10,12 @@ import json
 import logging
 import os
 import re
-import socket
 import subprocess
 import tempfile
 from collections import OrderedDict
+
+# Dispatcher
+from dispatcherd.factories import get_control_from_settings
 
 # Django
 from django.conf import settings
@@ -24,7 +26,6 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.timezone import now
 from django.utils.encoding import smart_str
 from django.contrib.contenttypes.models import ContentType
-from flags.state import flag_enabled
 
 # REST Framework
 from rest_framework.exceptions import ParseError
@@ -39,7 +40,6 @@ from ansible_base.rbac.models import RoleEvaluation
 # AWX
 from awx.main.models.base import CommonModelNameNotUnique, PasswordFieldsModel, NotificationFieldsModel
 from awx.main.dispatch import get_task_queuename
-from awx.main.dispatch.control import Control as ControlDispatcher
 from awx.main.registrar import activity_stream_registrar
 from awx.main.models.mixins import TaskManagerUnifiedJobMixin, ExecutionEnvironmentMixin
 from awx.main.models.rbac import to_permissions
@@ -58,7 +58,8 @@ from awx.main.utils.common import (
 )
 from awx.main.utils.encryption import encrypt_dict, decrypt_field
 from awx.main.utils import polymorphic
-from awx.main.constants import ACTIVE_STATES, CAN_CANCEL, JOB_VARIABLE_PREFIXES
+from awx.main.constants import ACTIVE_STATES, CAN_CANCEL
+from awx.main.utils.common import get_job_variable_prefixes
 from awx.main.redact import UriCleaner, REPLACE_STR
 from awx.main.consumers import emit_channel_notification
 from awx.main.fields import AskForField, OrderedManyToManyField
@@ -304,7 +305,7 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
     def save(self, *args, **kwargs):
         # If update_fields has been specified, add our field names to it,
         # if it hasn't been specified, then we're just doing a normal save.
-        update_fields = kwargs.get('update_fields', [])
+        update_fields = kwargs.get('update_fields') or []
         # Update status and last_updated fields.
         if not getattr(_inventory_updates, 'is_updating', False):
             updated_fields = self._set_status_and_last_job_run(save=False)
@@ -876,7 +877,7 @@ class UnifiedJob(
         """
         # If update_fields has been specified, add our field names to it,
         # if it hasn't been specified, then we're just doing a normal save.
-        update_fields = kwargs.get('update_fields', [])
+        update_fields = kwargs.get('update_fields') or []
 
         # Get status before save...
         status_before = self.status or 'new'
@@ -918,7 +919,7 @@ class UnifiedJob(
 
         # If we have a start and finished time, and haven't already calculated
         # out the time that elapsed, do so.
-        if self.started and self.finished and self.elapsed == 0.0:
+        if self.started and self.finished and self.elapsed == decimal.Decimal(0):
             td = self.finished - self.started
             elapsed = decimal.Decimal(td.total_seconds())
             self.elapsed = elapsed.quantize(dq)
@@ -1354,8 +1355,6 @@ class UnifiedJob(
                     status_data['instance_group_name'] = None
             elif status in ['successful', 'failed', 'canceled'] and self.finished:
                 status_data['finished'] = datetime.datetime.strftime(self.finished, "%Y-%m-%dT%H:%M:%S.%fZ")
-            elif status == 'running':
-                status_data['started'] = datetime.datetime.strftime(self.finished, "%Y-%m-%dT%H:%M:%S.%fZ")
             status_data.update(self.websocket_emit_data())
             status_data['group_name'] = 'jobs'
             if getattr(self, 'unified_job_template_id', None):
@@ -1487,53 +1486,17 @@ class UnifiedJob(
             return 'Previous Task Canceled: {"job_type": "%s", "job_name": "%s", "job_id": "%s"}' % (self.model_to_str(), self.name, self.id)
         return None
 
-    def fallback_cancel(self):
-        if not self.celery_task_id:
-            self.refresh_from_db(fields=['celery_task_id'])
-        self.cancel_dispatcher_process()
-
     def cancel_dispatcher_process(self):
         """Returns True if dispatcher running this job acknowledged request and sent SIGTERM"""
         if not self.celery_task_id:
             return False
 
-        canceled = []
-        # Special case for task manager (used during workflow job cancellation)
-        if not connection.get_autocommit():
-            if flag_enabled('FEATURE_DISPATCHERD_ENABLED'):
-                try:
-                    from dispatcherd.factories import get_control_from_settings
-
-                    ctl = get_control_from_settings()
-                    ctl.control('cancel', data={'uuid': self.celery_task_id})
-                except Exception:
-                    logger.exception("Error sending cancel command to new dispatcher")
-            else:
-                try:
-                    ControlDispatcher('dispatcher', self.controller_node).cancel([self.celery_task_id], with_reply=False)
-                except Exception:
-                    logger.exception("Error sending cancel command to legacy dispatcher")
-            return True  # task manager itself needs to act under assumption that cancel was received
-
-        # Standard case with reply
         try:
-            timeout = 5
-            if flag_enabled('FEATURE_DISPATCHERD_ENABLED'):
-                from dispatcherd.factories import get_control_from_settings
-
-                ctl = get_control_from_settings()
-                results = ctl.control_with_reply('cancel', data={'uuid': self.celery_task_id}, expected_replies=1, timeout=timeout)
-                # Check if cancel was successful by checking if we got any results
-                return bool(results and len(results) > 0)
-            else:
-                # Original implementation
-                canceled = ControlDispatcher('dispatcher', self.controller_node).cancel([self.celery_task_id])
-        except socket.timeout:
-            logger.error(f'could not reach dispatcher on {self.controller_node} within {timeout}s')
+            logger.info(f'Sending cancel message to pg_notify channel {self.controller_node} for task {self.celery_task_id}')
+            ctl = get_control_from_settings(default_publish_channel=self.controller_node)
+            ctl.control('cancel', data={'uuid': self.celery_task_id})
         except Exception:
-            logger.exception("error encountered when checking task status")
-
-        return bool(self.celery_task_id in canceled)  # True or False, whether confirmation was obtained
+            logger.exception("Error sending cancel command to dispatcher")
 
     def cancel(self, job_explanation=None, is_chain=False):
         if self.can_cancel:
@@ -1556,19 +1519,13 @@ class UnifiedJob(
                 # the job control process will use the cancel_flag to distinguish a shutdown from a cancel
                 self.save(update_fields=cancel_fields)
 
-            controller_notified = False
-            if self.celery_task_id:
-                controller_notified = self.cancel_dispatcher_process()
+            # Be extra sure we have the task id, in case job is transitioning into running right now
+            if not self.celery_task_id:
+                self.refresh_from_db(fields=['celery_task_id', 'controller_node'])
 
-            # If a SIGTERM signal was sent to the control process, and acked by the dispatcher
-            # then we want to let its own cleanup change status, otherwise change status now
-            if not controller_notified:
-                if self.status != 'canceled':
-                    self.status = 'canceled'
-                    self.save(update_fields=['status'])
-                # Avoid race condition where we have stale model from pending state but job has already started,
-                # its checking signal but not cancel_flag, so re-send signal after updating cancel fields
-                self.fallback_cancel()
+            # send pg_notify message to cancel, will not send until transaction completes
+            if self.celery_task_id:
+                self.cancel_dispatcher_process()
 
         return self.cancel_flag
 
@@ -1612,7 +1569,8 @@ class UnifiedJob(
         by AWX, for purposes of client playbook hooks
         """
         r = {}
-        for name in JOB_VARIABLE_PREFIXES:
+        prefixes = get_job_variable_prefixes()
+        for name in prefixes:
             r['{}_job_id'.format(name)] = self.pk
             r['{}_job_launch_type'.format(name)] = self.launch_type
 
@@ -1621,7 +1579,7 @@ class UnifiedJob(
         wj = self.get_workflow_job()
         if wj:
             schedule = getattr_dne(wj, 'schedule')
-            for name in JOB_VARIABLE_PREFIXES:
+            for name in prefixes:
                 r['{}_workflow_job_id'.format(name)] = wj.pk
                 r['{}_workflow_job_name'.format(name)] = wj.name
                 r['{}_workflow_job_launch_type'.format(name)] = wj.launch_type
@@ -1632,12 +1590,12 @@ class UnifiedJob(
         if not created_by:
             schedule = getattr_dne(self, 'schedule')
             if schedule:
-                for name in JOB_VARIABLE_PREFIXES:
+                for name in prefixes:
                     r['{}_schedule_id'.format(name)] = schedule.pk
                     r['{}_schedule_name'.format(name)] = schedule.name
 
         if created_by:
-            for name in JOB_VARIABLE_PREFIXES:
+            for name in prefixes:
                 r['{}_user_id'.format(name)] = created_by.pk
                 r['{}_user_name'.format(name)] = created_by.username
                 r['{}_user_email'.format(name)] = created_by.email
@@ -1646,7 +1604,7 @@ class UnifiedJob(
 
         inventory = getattr_dne(self, 'inventory')
         if inventory:
-            for name in JOB_VARIABLE_PREFIXES:
+            for name in prefixes:
                 r['{}_inventory_id'.format(name)] = inventory.pk
                 r['{}_inventory_name'.format(name)] = inventory.name
 

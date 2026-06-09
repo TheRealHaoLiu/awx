@@ -43,6 +43,9 @@ from django.apps import apps
 # AWX
 from awx.conf.license import get_license
 
+# ansible-runner
+from ansible_runner.utils.capacity import get_mem_in_bytes, get_cpu_count
+
 logger = logging.getLogger('awx.main.utils')
 
 __all__ = [
@@ -90,6 +93,7 @@ __all__ = [
     'get_event_partition_epoch',
     'cleanup_new_process',
     'unified_job_class_to_event_table_name',
+    'get_job_variable_prefixes',
 ]
 
 
@@ -770,6 +774,21 @@ def get_cpu_effective_capacity(cpu_count, is_control_node=False):
     return max(1, int(cpu_count * forkcpu))
 
 
+def get_job_variable_prefixes():
+    """Return the list of active job variable prefixes based on INCLUDE_DEPRECATED_AWX_VAR_PREFIX setting.
+
+    When True (default), returns both 'awx' and 'tower' prefixes for backward compatibility.
+    When False, returns only 'tower'. The 'awx' prefix is deprecated and this setting
+    will default to False in a future release.
+    """
+    from django.conf import settings
+
+    include_awx = getattr(settings, 'INCLUDE_DEPRECATED_AWX_VAR_PREFIX', True)
+    if include_awx:
+        return ['awx', 'tower']
+    return ['tower']
+
+
 def convert_mem_str_to_bytes(mem_str):
     """Convert string with suffix indicating units to memory in bytes (base 2)
 
@@ -997,9 +1016,15 @@ def getattrd(obj, name, default=NoDefaultProvided):
         raise
 
 
-def getattr_dne(obj, name, notfound=ObjectDoesNotExist):
+empty = object()
+
+
+def getattr_dne(obj, name, default=empty, notfound=ObjectDoesNotExist):
     try:
-        return getattr(obj, name)
+        if default is empty:
+            return getattr(obj, name)
+        else:
+            return getattr(obj, name, default)
     except notfound:
         return None
 
@@ -1220,3 +1245,38 @@ def unified_job_class_to_event_table_name(job_class):
 
 def load_all_entry_points_for(entry_point_subsections: list[str], /) -> dict[str, EntryPoint]:
     return {ep.name: ep for entry_point_category in entry_point_subsections for ep in entry_points(group=f'awx_plugins.{entry_point_category}')}
+
+
+def get_auto_max_workers():
+    """Method we normally rely on to get max_workers
+
+    Uses almost same logic as Instance.local_health_check
+    The important thing is to be MORE than Instance.capacity
+    so that the task-manager does not over-schedule this node
+
+    Ideally we would just use the capacity from the database plus reserve workers,
+    but this poses some bootstrap problems where OCP task containers
+    register themselves after startup
+    """
+    # Get memory from ansible-runner
+    total_memory_gb = get_mem_in_bytes()
+
+    # This may replace memory calculation with a user override
+    corrected_memory = get_corrected_memory(total_memory_gb)
+
+    # Get same number as max forks based on memory, this function takes memory as bytes
+    mem_capacity = get_mem_effective_capacity(corrected_memory, is_control_node=True)
+
+    # Follow same process for CPU capacity constraint
+    cpu_count = get_cpu_count()
+    corrected_cpu = get_corrected_cpu(cpu_count)
+    cpu_capacity = get_cpu_effective_capacity(corrected_cpu, is_control_node=True)
+
+    # Here is what is different from health checks,
+    auto_max = max(mem_capacity, cpu_capacity)
+
+    # add magic number of extra workers to ensure
+    # we have a few extra workers to run the heartbeat
+    auto_max += 7
+
+    return auto_max
